@@ -1,0 +1,4 @@
+seq_bad missing header marker
+ATGCCCXXXGGGTTT123AAATAG
+>seq_ok test sequence
+ATGAAATTTGGGTAA

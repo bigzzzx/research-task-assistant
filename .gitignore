@@ -1,0 +1,17 @@
+# Local configuration and runtime data
+.env
+.env.*
+!.env.example
+var/
+.cache/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+
+# Interview material and Office lock files stay local
+/智能体开发实践考题*.docx
+~$*.docx
