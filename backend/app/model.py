@@ -8,6 +8,7 @@ import json
 import httpx
 
 from .config import Settings
+from .context import estimate_input_tokens
 
 
 class ModelError(Exception):
@@ -59,21 +60,26 @@ class DeepSeek:
         tools: list[dict],
         choice: str | dict,
         on_text: Callable[[str], None] | None = None,
+        *,
+        max_tokens: int = 1500,
+        timeout: float = 55,
     ) -> ModelReply:
         if not self.settings.api_key:
             raise ModelError("请在 .env 中填写 DEEPSEEK_API_KEY 并重启后端。")
+        if estimate_input_tokens(messages, tools, choice) > self.settings.input_token_budget:
+            raise ModelError("当前问题和必要的工具信息超出输入预算。请缩短问题，或分开查询任务。")
 
         request = {
             "model": self.settings.model,
             "messages": messages,
-            "tools": tools,
-            "tool_choice": choice,
             "thinking": {"type": "disabled"},
-            "max_tokens": 1500,
+            "max_tokens": max_tokens,
             "stream": True,
         }
+        if tools:
+            request.update(tools=tools, tool_choice=choice)
         try:
-            async with asyncio.timeout(55):
+            async with asyncio.timeout(timeout):
                 async with self.client.stream(
                     "POST",
                     f"{self.settings.base_url}/chat/completions",

@@ -9,6 +9,7 @@ SAMPLES = ("sample1.fasta", "sample2.fasta", "sample3.fasta")
 ANALYSES = ("seq_stats", "find_orf")
 UPLOAD_LIMIT = 5 * 1024 * 1024
 LOG_LIMIT = 8 * 1024
+DEFAULT_INPUT_TOKEN_BUDGET = 24_000
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,7 @@ class Settings:
     api_key: str = field(default="", repr=False)
     job_timeout: float = 60
     job_workers: int = 2
+    input_token_budget: int = DEFAULT_INPUT_TOKEN_BUDGET
 
     @classmethod
     def load(cls) -> "Settings":
@@ -27,9 +29,17 @@ class Settings:
         def value(key: str, default: str = "") -> str:
             return (os.environ.get(key, values.get(key)) or default).strip()
 
+        try:
+            input_budget = int(value("DEEPSEEK_INPUT_TOKEN_BUDGET", str(DEFAULT_INPUT_TOKEN_BUDGET)))
+            if input_budget < 4096:
+                raise ValueError
+        except ValueError:
+            raise ValueError("DEEPSEEK_INPUT_TOKEN_BUDGET 必须是至少 4096 的整数。") from None
+
         return cls(
             data_dir=(ROOT / value("APP_DATA_DIR", "var")).resolve(),
             model=value("DEEPSEEK_MODEL", "deepseek-flash"),
             base_url=value("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/"),
             api_key=value("DEEPSEEK_API_KEY"),
+            input_token_budget=input_budget,
         )

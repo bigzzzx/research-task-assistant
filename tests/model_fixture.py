@@ -62,7 +62,7 @@ class ModelFixture:
         assert body["thinking"] == {"type": "disabled"}
         self.requests.append(body)
         messages = body["messages"]
-        choice = body["tool_choice"]
+        choice = body.get("tool_choice", "none")
         question = next(message["content"] for message in reversed(messages) if message["role"] == "user")
         observations = [json.loads(message["content"]) for message in messages if message["role"] == "tool"]
 
@@ -88,9 +88,12 @@ class ModelFixture:
             events = call_events([("submit_job", {"wrong": "argument"})])
         elif "不完整片段测试" in question:
             events = call_events([("submit_job", {"analysis_type": "seq_stats", "filename": "sample1"})])[:-1]
-        elif "查状态" in question and re.search(r"[a-f0-9]{8,32}", question):
-            job_id = re.search(r"[a-f0-9]{8,32}", question).group()
-            events = call_events([("job_status", {"job_id": job_id})])
+        elif "查状态" in question:
+            context = json.loads(messages[0]["content"].split("\n会话数据 ", 1)[1])
+            references = context["referenced_jobs"]
+            supplied = re.search(r"[a-f0-9]{8,32}", question)
+            job_id = supplied.group() if supplied else references[0]["job_id"] if len(references) == 1 else None
+            events = call_events([("job_status", {"job_id": job_id})]) if job_id else text_events("请选择原任务。")
         else:
             context = json.loads(messages[0]["content"].split("\n会话数据 ", 1)[1])
             filename = self._filename(question, context["available_files"])

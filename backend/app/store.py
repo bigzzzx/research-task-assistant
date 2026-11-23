@@ -7,6 +7,7 @@ import sqlite3
 from uuid import uuid4
 
 from .config import SAMPLES
+from .context import HistoryTurn
 
 
 def now() -> str:
@@ -66,7 +67,15 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE(conversation_id, client_message_id)
 );
 CREATE INDEX IF NOT EXISTS messages_conversation ON messages(conversation_id, id);
+CREATE INDEX IF NOT EXISTS messages_by_turn ON messages(conversation_id, COALESCE(turn_id, id));
 CREATE UNIQUE INDEX IF NOT EXISTS one_job_summary ON messages(job_id) WHERE kind = 'summary';
+
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    through_turn_id INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS jobs (
     id TEXT PRIMARY KEY,
@@ -316,18 +325,47 @@ class Store:
             ).fetchall()
         return [self.message(row["id"]) for row in rows]
 
-    def history(self, conversation_id: str, before_user_id: int) -> list[dict]:
+    def history_turns(
+        self, conversation_id: str, *, before: int, after: int, limit: int,
+        newest: bool = True, include_task_summaries: bool = True,
+    ) -> list[HistoryTurn]:
+        direction = "DESC" if newest else "ASC"
         rows = self._all(
-            """SELECT kind, content FROM messages
-               WHERE conversation_id=? AND COALESCE(turn_id, id)<?
-               AND kind IN ('user', 'assistant', 'summary') AND status='done'
-               ORDER BY COALESCE(turn_id, id) DESC, id DESC LIMIT 20""",
-            (conversation_id, before_user_id),
+            f"""WITH turns AS (
+                    SELECT id FROM messages WHERE conversation_id=? AND kind='user'
+                    AND status IN ('done', 'error', 'interrupted') AND id>? AND id<?
+                    ORDER BY id {direction} LIMIT ?
+                )
+                SELECT t.id AS origin, m.kind, m.content
+                FROM turns t JOIN messages m ON COALESCE(m.turn_id, m.id)=t.id
+                WHERE m.conversation_id=? AND (
+                    m.kind='user' OR (m.status='done' AND
+                        (m.kind='assistant' OR (? AND m.kind='summary')))
+                )
+                ORDER BY t.id, m.id""",
+            (conversation_id, after, before, limit, conversation_id, include_task_summaries),
         )
-        return [
-            {"role": "user" if row["kind"] == "user" else "assistant", "content": row["content"][:2500]}
-            for row in reversed(rows) if row["content"]
-        ]
+        groups: dict[int, list[dict]] = {}
+        for row in rows:
+            if row["content"]:
+                groups.setdefault(row["origin"], []).append({
+                    "role": "user" if row["kind"] == "user" else "assistant",
+                    "content": row["content"][:2500],
+                })
+        return [HistoryTurn(turn_id, messages) for turn_id, messages in groups.items()]
+
+    def conversation_summary(self, conversation_id: str) -> dict | None:
+        return self._one("SELECT * FROM conversation_summaries WHERE conversation_id=?", (conversation_id,))
+
+    def save_conversation_summary(self, conversation_id: str, through_turn_id: int, content: str) -> None:
+        with self.db:
+            self.db.execute("""
+                INSERT INTO conversation_summaries (conversation_id, through_turn_id, content, updated_at)
+                VALUES (?,?,?,?)
+                ON CONFLICT(conversation_id) DO UPDATE SET through_turn_id=excluded.through_turn_id,
+                    content=excluded.content, updated_at=excluded.updated_at
+                WHERE excluded.through_turn_id>conversation_summaries.through_turn_id
+            """, (conversation_id, through_turn_id, content, now()))
 
     def snapshot(self, owner_id: str, conversation_id: str) -> dict | None:
         conversation = self.owned_conversation(owner_id, conversation_id)
@@ -347,6 +385,22 @@ class Store:
             JOB_SELECT + " WHERE j.conversation_id=? AND j.origin_message_id<? ORDER BY j.created_at DESC LIMIT 8",
             (conversation_id, before_user_id),
         )
+
+    def job_filenames(self, conversation_id: str, before_user_id: int) -> list[str]:
+        rows = self._all("""
+            SELECT DISTINCT COALESCE(j.input_name, f.display_name) AS filename
+            FROM jobs j JOIN files f ON f.id=j.file_id
+            WHERE j.conversation_id=? AND j.origin_message_id<?
+            ORDER BY filename
+        """, (conversation_id, before_user_id))
+        return [row["filename"] for row in rows]
+
+    def jobs_for_filename(self, conversation_id: str, before_user_id: int, filename: str) -> list[dict]:
+        return self._all(JOB_SELECT + """
+            WHERE j.conversation_id=? AND j.origin_message_id<?
+            AND COALESCE(j.input_name, f.display_name)=?
+            ORDER BY j.created_at DESC LIMIT 3
+        """, (conversation_id, before_user_id, filename))
 
     def job(self, job_id: str) -> dict | None:
         return self._one(JOB_SELECT + " WHERE j.id=?", (job_id,))
