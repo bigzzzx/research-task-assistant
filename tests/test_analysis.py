@@ -3,7 +3,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from backend.app.config import LOG_LIMIT, ROOT
-from backend.app.jobs import bounded_log
+from backend.app.jobs import LOG_PAGE_BYTES, bounded_log, log_page
 from scripts.fasta import InvalidFasta, Record, read_fasta
 from scripts.find_orf import find_orf
 from scripts.seq_stats import seq_stats
@@ -85,3 +85,15 @@ class AnalysisTests(TestCase):
             self.assertIn("[... log truncated ...]", preview)
             path.write_bytes(b"short")
             self.assertEqual(bounded_log(path), ("short", False))
+
+    def test_complete_log_pages_reassemble_utf8_across_boundaries(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "output.log"
+            expected = "A" * (LOG_PAGE_BYTES - 1) + "甲乙与终点\n"
+            path.write_bytes(expected.encode("utf-8"))
+            page1 = log_page(path, 0, finished=True)
+            self.assertTrue(page1["has_more"])
+            page2 = log_page(path, page1["next_offset"], finished=True)
+            self.assertFalse(page2["has_more"])
+            self.assertEqual(page1["text"] + page2["text"], expected)
+            self.assertEqual(page2["next_offset"], len(expected.encode("utf-8")))

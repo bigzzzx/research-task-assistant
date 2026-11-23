@@ -1,6 +1,7 @@
 """Start only the two analysis scripts and persist each observed transition."""
 
 import asyncio
+import codecs
 from collections.abc import Callable
 from contextlib import suppress
 import os
@@ -14,6 +15,7 @@ from .store import Store
 
 SCRIPTS = {analysis: ROOT / "scripts" / f"{analysis}.py" for analysis in ANALYSES}
 TERMINAL = {"succeeded", "failed"}
+LOG_PAGE_BYTES = 64 * 1024
 
 
 class Jobs:
@@ -38,7 +40,7 @@ class Jobs:
 
     def enqueue(self, job: dict) -> None:
         self._queue.put_nowait(job["id"])
-        self.events.send("job.updated", job)
+        self.events.send(job["owner_id"], "job.updated", job)
 
     def directory(self, job_id: str) -> Path:
         return self.settings.data_dir / "jobs" / job_id
@@ -58,21 +60,13 @@ class Jobs:
                 output[stream], output[f"{stream}_truncated"] = "当前无法读取此日志文件。", False
         return {**status_view(job), **output}
 
-    def _input(self, file_id: str) -> Path:
-        file = self.store.file(file_id)
-        folder = ROOT / "data" if file["source"] == "sample" else self.settings.data_dir / "uploads"
-        candidate = (folder / file["storage_name"]).resolve(strict=True)
-        if candidate.parent != folder.resolve() or not candidate.is_file():
-            raise OSError("Unregistered input location")
-        return candidate
-
     async def _worker(self) -> None:
         while True:
             job_id = await self._queue.get()
             try:
                 job = self.store.claim_job(job_id)
                 if job:
-                    self.events.send("job.updated", job)
+                    self.events.send(job["owner_id"], "job.updated", job)
                     await self._run(job)
             finally:
                 self._queue.task_done()
@@ -83,7 +77,10 @@ class Jobs:
         runner_error = None
         try:
             self.directory(job_id).mkdir(parents=True, exist_ok=True)
-            file_path = self._input(job["file_id"])
+            file = self.store.owned_file(job["owner_id"], job["file_id"])
+            if not file:
+                raise OSError("Unregistered input")
+            file_path = registered_input(self.settings.data_dir, file)
             with (
                 self.log_path(job_id, "stdout").open("wb") as stdout,
                 self.log_path(job_id, "stderr").open("wb") as stderr,
@@ -96,7 +93,7 @@ class Jobs:
             runner_error = "无法启动分析脚本或读取输入文件。请确认文件可读、项目目录可写。"
 
         finished = self.store.finish_job(job_id, exit_code, runner_error)
-        self.events.send("job.updated", finished)
+        self.events.send(finished["owner_id"], "job.updated", finished)
         self.on_finish(finished)
 
     async def _run_process(self, script: Path, file_path: Path, stdout, stderr) -> tuple[int, str | None]:
@@ -123,6 +120,33 @@ class Jobs:
             if isinstance(exc, asyncio.CancelledError):
                 raise
             return exit_code, f"分析超过 {self.settings.job_timeout:g} 秒，已结束子进程。可核对输入后重试。"
+
+
+def registered_input(data_dir: Path, file: dict) -> Path:
+    folder = ROOT / "data" if file["source"] == "sample" else data_dir / "uploads"
+    candidate = (folder / file["storage_name"]).resolve(strict=True)
+    if candidate.parent != folder.resolve() or not candidate.is_file():
+        raise OSError("Unregistered input location")
+    return candidate
+
+
+def log_page(path: Path, offset: int, *, finished: bool) -> dict:
+    try:
+        with path.open("rb") as source:
+            size = os.fstat(source.fileno()).st_size
+            start = min(offset, size)
+            source.seek(start)
+            data = source.read(min(LOG_PAGE_BYTES, size - start))
+    except FileNotFoundError:
+        return {"text": "", "next_offset": 0, "has_more": False, "available": False}
+
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    text = decoder.decode(data, final=finished and start + len(data) == size)
+    next_offset = start + len(data) - len(decoder.getstate()[0])
+    return {
+        "text": text, "next_offset": next_offset, "available": True,
+        "has_more": start + len(data) < size,
+    }
 
 
 def bounded_log(path: Path) -> tuple[str, bool]:

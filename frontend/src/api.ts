@@ -1,6 +1,11 @@
 export type JobState = 'queued' | 'running' | 'succeeded' | 'failed';
 export type Analysis = 'seq_stats' | 'find_orf';
 
+export interface Account {
+  id: string;
+  username: string;
+}
+
 export interface Conversation {
   id: string;
   title: string;
@@ -51,6 +56,20 @@ export interface LocalFile {
   display_name: string;
   source: 'sample' | 'upload';
   size_bytes: number;
+  created_at: string | null;
+}
+
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  parameters: { properties: Record<string, { type: string; description: string; enum?: string[] }>; required: string[] };
+}
+
+export interface JobLog {
+  text: string;
+  next_offset: number;
+  has_more: boolean;
+  available: boolean;
 }
 
 export interface Config {
@@ -63,22 +82,46 @@ export interface Config {
 export interface Room {
   messages: Message[];
   jobs: Job[];
-  files: LocalFile[];
 }
 
 export interface Snapshot extends Room {
   conversation: Conversation;
+  files: LocalFile[];
 }
 
 export function roomPath(id: string): string {
   return '/api/conversations/' + id;
 }
 
+export class RequestError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
+export const SESSION_CHANGED = 'research-session-changed';
+let expectedAccount: string | undefined;
+
+export function bindAccount(account?: Account) {
+  expectedAccount = account?.id;
+}
+
+export function accountUrl(path: string): string {
+  if (!expectedAccount) return path;
+  return path + (path.includes('?') ? '&' : '?') + 'account=' + encodeURIComponent(expectedAccount);
+}
+
 export async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, { cache: 'no-store', ...init });
+  const headers = new Headers(init?.headers);
+  const account = url.startsWith('/api/auth/') ? undefined : expectedAccount;
+  if (account) headers.set('X-Workspace-Account', account);
+  const response = await fetch(url, { cache: 'no-store', ...init, headers });
   const data = await response.json().catch(() => undefined);
   if (!response.ok) {
-    throw new Error(typeof data?.detail === 'string' ? data.detail : '请求失败，请检查本机后端。');
+    if (response.status === 401 && account && account === expectedAccount) {
+      window.dispatchEvent(new Event(SESSION_CHANGED));
+    }
+    throw new RequestError(response.status, typeof data?.detail === 'string' ? data.detail : '请求失败，请检查本机后端。');
   }
   return data as T;
 }
@@ -91,8 +134,9 @@ export function sendText(id: string, text: string, clientId: string): Promise<Me
   });
 }
 
-export function uploadFile(id: string, file: File): Promise<LocalFile> {
-  return request(roomPath(id) + '/files?filename=' + encodeURIComponent(file.name), {
+export function uploadFile(file: File, conversationId?: string): Promise<LocalFile> {
+  const folder = conversationId ? roomPath(conversationId) + '/files' : '/api/files';
+  return request(folder + '?filename=' + encodeURIComponent(file.name), {
     method: 'POST',
     headers: { 'Content-Type': 'application/octet-stream' },
     body: file,

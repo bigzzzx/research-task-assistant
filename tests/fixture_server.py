@@ -12,4 +12,5 @@ app = create_app(
     Settings(data_dir=ROOT / ".cache" / f"browser-fixture-{uuid4().hex}",
              model="local-test-fixture", api_key="fixture-key"),
     model_transport=httpx.MockTransport(ModelFixture(delay=0.06)),
+    frontend_dir=ROOT / ".cache" / "account-dist",
 )

@@ -55,7 +55,11 @@ class Tools:
         self.store = store
         self.jobs = jobs
 
-    def execute(self, conversation_id: str, turn_id: int, name: str, raw: str, *, only_job: str | None = None) -> dict:
+    def execute(
+        self, owner_id: str, conversation_id: str, turn_id: int, name: str, raw: str, *, only_job: str | None = None,
+    ) -> dict:
+        if not self.store.owned_conversation(owner_id, conversation_id):
+            return tool_error("CONVERSATION_NOT_FOUND", "当前账号找不到此会话。")
         if name not in DEFINITIONS or (only_job and name == "submit_job"):
             return tool_error("UNKNOWN_TOOL", "这一轮无法使用这个工具。")
         try:
@@ -68,7 +72,7 @@ class Tools:
             return tool_error("INVALID_ARGUMENTS", f"请提供有效的字段：{', '.join(expected)}。")
 
         if name == "submit_job":
-            return self.submit(conversation_id, turn_id, arguments["analysis_type"], arguments["filename"])
+            return self._submit(owner_id, conversation_id, turn_id, arguments["analysis_type"], arguments["filename"])
 
         job_id = arguments["job_id"]
         job = self.find_job(conversation_id, job_id)
@@ -85,14 +89,14 @@ class Tools:
         matches = self.store.jobs_with_prefix(conversation_id, job_id.lower())
         return matches[0] if len(matches) == 1 else None
 
-    def submit(self, conversation_id: str, turn_id: int, analysis_type: str, filename: str) -> dict:
+    def _submit(self, owner_id: str, conversation_id: str, turn_id: int, analysis_type: str, filename: str) -> dict:
         if analysis_type not in ANALYSES:
             return tool_error("UNKNOWN_ANALYSIS", "可用的分析是 seq_stats 和 find_orf。")
         if any(char in filename for char in "/\\:"):
-            return tool_error("INVALID_FILENAME", "请使用已有样例或本会话上传的文件名。")
+            return tool_error("INVALID_FILENAME", "请使用已有样例或本账号上传的文件名。")
 
         key = filename.strip().casefold()
-        files = self.store.files(conversation_id)
+        files = self.store.files(owner_id)
         matches = [item for item in files if item["name_key"] == key]
         if not matches and not PurePath(key).suffix:
             matches = [item for item in files if PurePath(item["name_key"]).stem == key]

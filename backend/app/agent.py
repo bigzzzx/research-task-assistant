@@ -20,7 +20,7 @@ PASS_LIMIT = 5000
 
 SYSTEM_PROMPT = """你是本机科研计算任务助手，使用用户的语言回答。
 可统计 FASTA 各序列的长度和 GC（seq_stats），或寻找正链最长完整 ORF（find_orf）。
-明确要求分析时，调用 submit_job。文件只用当前会话提供的登记名或已知样例名。
+明确要求分析时，调用 submit_job。文件只用当前用户的登记名或已知样例名。
 用户说“再对某文件做一次”，沿用当前会话最近明确提交的分析类型。指代确实有多个候选时先澄清。
 用户问具体任务进度时调用 job_status。失败后立即 read_log 并解释原因与修正办法。
 submit_job 的 queued/running 返回表示已受理，简短确认文件和任务 ID，后台完成后会跟进。不要反复查状态。
@@ -33,8 +33,9 @@ GC 显示两位小数，ORF 起止从 1 开始且包含终止密码子，长度�
 
 @dataclass(frozen=True)
 class Turn:
+    owner_id: str
     conversation_id: str
-    user_id: int
+    message_id: int
     job_id: str | None = None
 
 
@@ -61,27 +62,27 @@ class Agent:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
-    def chat(self, message: dict, tools: Tools) -> None:
-        self._start(self._chat(message, tools))
+    def chat(self, owner_id: str, message: dict, tools: Tools) -> None:
+        self._start(self._chat(owner_id, message, tools))
 
     def complete(self, job: dict, tools: Tools) -> None:
         self._start(self._complete(job, tools))
 
-    async def _chat(self, message: dict, tools: Tools) -> None:
-        turn = Turn(message["conversation_id"], message["id"])
+    async def _chat(self, owner_id: str, message: dict, tools: Tools) -> None:
+        turn = Turn(owner_id, message["conversation_id"], message["id"])
         async with self._locks[turn.conversation_id]:
-            self._emit("message.updated", self.store.change_message(turn.user_id, status="running"))
+            self._emit(turn, "message.updated", self.store.change_message(turn.message_id, status="running"))
             try:
-                files = [item["display_name"] for item in self.store.files(turn.conversation_id)]
+                files = [item["display_name"] for item in self.store.files(turn.owner_id)]
                 recent_jobs = [
                     {"job_id": job["id"], "analysis_type": job["analysis_type"],
                      "filename": job["filename"], "state": job["state"]}
-                    for job in self.store.recent_jobs(turn.conversation_id, turn.user_id)
+                    for job in self.store.recent_jobs(turn.conversation_id, turn.message_id)
                 ]
                 context = {"available_files": files[:3] + files[3:][-40:], "recent_jobs": recent_jobs}
                 messages = [
                     {"role": "system", "content": SYSTEM_PROMPT + "\n会话数据 " + json.dumps(context, ensure_ascii=False)},
-                    *self.store.history(turn.conversation_id, turn.user_id),
+                    *self.store.history(turn.conversation_id, turn.message_id),
                     {"role": "user", "content": message["content"]},
                 ]
                 await self._react(turn, tools, messages)
@@ -91,23 +92,23 @@ class Agent:
                 logger.exception("Failed to process local conversation %s", turn.conversation_id)
                 self._fail_turn(turn, "处理这条消息时发生本地错误，请重试。")
             else:
-                self._emit("message.done", self.store.change_message(turn.user_id, status="done"))
+                self._emit(turn, "message.done", self.store.change_message(turn.message_id, status="done"))
 
     def _fail_turn(self, turn: Turn, explanation: str) -> None:
-        for partial in self.store.fail_drafts(turn.conversation_id, turn.user_id, turn.job_id):
-            self._emit("message.done", partial)
-        self._emit("message.done", self.store.change_message(turn.user_id, status="error"))
-        self._emit("message.done", self.store.add_message(
-            turn.conversation_id, turn.user_id, "assistant", content=explanation, status="error",
+        for partial in self.store.fail_drafts(turn.conversation_id, turn.message_id, turn.job_id):
+            self._emit(turn, "message.done", partial)
+        self._emit(turn, "message.done", self.store.change_message(turn.message_id, status="error"))
+        self._emit(turn, "message.done", self.store.add_message(
+            turn.conversation_id, turn.message_id, "assistant", content=explanation, status="error",
         ))
 
     async def _complete(self, job: dict, tools: Tools) -> None:
-        turn = Turn(job["conversation_id"], job["origin_message_id"], job["id"])
+        turn = Turn(job["owner_id"], job["conversation_id"], job["origin_message_id"], job["id"])
         async with self._locks[turn.conversation_id]:
             claimed = self.store.change_summary(job["id"], "pending", "running")
             if not claimed:
                 return
-            self.events.send("job.updated", claimed)
+            self.events.send(turn.owner_id, "job.updated", claimed)
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": (
@@ -141,13 +142,13 @@ class Agent:
                 nonlocal draft
                 if draft is None:
                     row = self.store.add_message(
-                        turn.conversation_id, turn.user_id, "summary" if turn.job_id else "assistant",
+                        turn.conversation_id, turn.message_id, "summary" if turn.job_id else "assistant",
                         status="running", job_id=turn.job_id,
                     )
                     draft = row["id"]
-                    self._emit("message.started", row)
+                    self._emit(turn, "message.started", row)
                 revision = self.store.append_delta(draft, delta)
-                self.events.send("message.delta", {
+                self.events.send(turn.owner_id, "message.delta", {
                     "conversation_id": turn.conversation_id,
                     "message_id": draft,
                     "revision": revision,
@@ -162,15 +163,15 @@ class Agent:
                 if draft is None or not reply.text.strip():
                     raise ModelError("DeepSeek 未返回可显示的回复，请重试。")
                 if turn.job_id:
-                    self._finish_summary(turn.job_id, draft, "done")
+                    self._finish_summary(turn, draft, "done")
                 else:
-                    self._emit("message.done", self.store.change_message(draft, status="done"))
+                    self._emit(turn, "message.done", self.store.change_message(draft, status="done"))
                 return
 
             if choice == "none":
                 raise ModelError("DeepSeek 在生成说明时返回了额外工具调用。")
             if draft is not None:
-                self._emit("message.done", self.store.change_message(draft, status="done"))
+                self._emit(turn, "message.done", self.store.change_message(draft, status="done"))
 
             calls = [call.protocol() for call in reply.calls]
             messages.append({"role": "assistant", "content": reply.text or None, "tool_calls": calls})
@@ -181,7 +182,7 @@ class Agent:
                     outcome = tool_error("UNEXPECTED_TOOL", f"请先对任务 {required[1]} 调用 {required[0]}。")
                 else:
                     outcome = tools.execute(
-                        turn.conversation_id, turn.user_id, call.name, call.arguments,
+                        turn.owner_id, turn.conversation_id, turn.message_id, call.name, call.arguments,
                         only_job=required[1] if required else turn.job_id,
                     )
 
@@ -203,37 +204,39 @@ class Agent:
         raise ModelError("本轮工具调用已达上限。可以按任务 ID 查询已提交的分析。")
 
     def _invocation(self, turn: Turn, calls: list[dict], source: str) -> dict:
-        return self._emit("tool.started", self.store.add_message(
-            turn.conversation_id, turn.user_id, "invocation",
+        return self._emit(turn, "tool.started", self.store.add_message(
+            turn.conversation_id, turn.message_id, "invocation",
             tool_calls=calls, job_id=turn.job_id, source=source,
         ))
 
     def _observation(self, turn: Turn, invocation_id: int, call: ToolCall, result: dict, source: str) -> None:
-        self._emit("tool.finished", self.store.add_message(
-            turn.conversation_id, turn.user_id, "tool",
+        self._emit(turn, "tool.finished", self.store.add_message(
+            turn.conversation_id, turn.message_id, "tool",
             content=json.dumps(result, ensure_ascii=False), job_id=result.get("job_id") or turn.job_id,
             tool_call_id=call.id, invocation_id=invocation_id, source=source,
         ))
 
-    def _emit(self, event: str, row: dict) -> dict:
-        self.events.send(event, row)
+    def _emit(self, turn: Turn, event: str, row: dict) -> dict:
+        self.events.send(turn.owner_id, event, row)
         return row
 
-    def _finish_summary(self, job_id: str, message_id: int, state: str) -> None:
-        message, job = self.store.finish_summary(job_id, message_id, state)
-        self._emit("message.done", message)
-        self.events.send("job.updated", job)
+    def _finish_summary(self, turn: Turn, message_id: int, state: str) -> None:
+        message, job = self.store.finish_summary(turn.job_id, message_id, state)
+        self._emit(turn, "message.done", message)
+        self.events.send(turn.owner_id, "job.updated", job)
 
     def _fallback(self, turn: Turn, tools: Tools, reason: str) -> None:
         call = ToolCall(f"system_{uuid4().hex}", "read_log", json.dumps({"job_id": turn.job_id}))
         invocation = self._invocation(turn, [call.protocol()], "system")
-        log = tools.execute(turn.conversation_id, turn.user_id, call.name, call.arguments, only_job=turn.job_id)
+        log = tools.execute(
+            turn.owner_id, turn.conversation_id, turn.message_id, call.name, call.arguments, only_job=turn.job_id,
+        )
         self._observation(turn, invocation["id"], call, log, "system")
         note = self.store.add_message(
-            turn.conversation_id, turn.user_id, "summary", job_id=turn.job_id,
+            turn.conversation_id, turn.message_id, "summary", job_id=turn.job_id,
             content=fallback_explanation(log, reason),
         )
-        self._finish_summary(turn.job_id, note["id"], "error")
+        self._finish_summary(turn, note["id"], "error")
 
 
 def model_observation(result: dict) -> str:

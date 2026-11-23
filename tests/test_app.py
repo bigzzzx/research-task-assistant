@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import time
 from unittest import IsolatedAsyncioTestCase
 
 import httpx
@@ -15,13 +16,34 @@ from backend.app.store import Store
 from tests.model_fixture import ModelFixture
 
 
+TEST_PASSWORD = "fixture passphrase for local checks"
+
+
 @asynccontextmanager
-async def service(settings, model):
+async def application(settings, model):
     app = create_app(settings, model_transport=httpx.MockTransport(model))
     async with app.router.lifespan_context(app):
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1",
-        ) as client:
+        yield app
+
+
+def client_for(app):
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1")
+
+
+async def sign_in(client, username):
+    credentials = {"username": username, "password": TEST_PASSWORD}
+    response = await client.post("/api/auth/register", json=credentials)
+    if response.status_code == 409:
+        response = await client.post("/api/auth/login", json=credentials)
+    assert response.status_code in {200, 201}, response.text
+    return response.json()
+
+
+@asynccontextmanager
+async def service(settings, model):
+    async with application(settings, model) as app:
+        async with client_for(app) as client:
+            await sign_in(client, "tester")
             yield client
 
 
@@ -180,8 +202,10 @@ class ApplicationTests(IsolatedAsyncioTestCase):
             self.assertEqual(restored["jobs"][0]["id"], job["id"])
 
     async def test_restart_recovers_pending_job_and_rejects_other_origins(self):
+        async with service(self.settings, self.model) as client:
+            owner = (await client.get("/api/auth/me")).json()["id"]
         store = Store(self.settings.data_dir / "assistant.sqlite3", ROOT / "data")
-        conversation = store.new_conversation()["id"]
+        conversation = store.new_conversation(owner)["id"]
         message, _ = store.user_message(conversation, "queued-user", "统计 sample1")
         job, _ = store.submit(conversation, message["id"], "sample1.fasta", "seq_stats")
         store.claim_job(job["id"])
@@ -214,9 +238,9 @@ class ApplicationTests(IsolatedAsyncioTestCase):
 
     async def test_sse_pushes_utf8_json_and_detaches_old_connections(self):
         events = Events()
-        stream = events.listen()
+        stream = events.listen("owner", "session", int(time()) + 30)
         self.assertIn("event: ready", await anext(stream))
-        events.send("job.updated", {"state": "成功"})
+        events.send("owner", "job.updated", {"state": "成功"})
         self.assertIn('data: {"state": "成功"}', await anext(stream))
         await stream.aclose()
-        self.assertEqual(events._listeners, set())
+        self.assertEqual(events._listeners, {})

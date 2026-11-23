@@ -1,12 +1,16 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { ChangeEvent, FormEvent, KeyboardEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import type { ChangeEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { X } from 'lucide-react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { roomPath, type Analysis, type Job, type LocalFile, type Message } from './api';
+import { AccountScreen } from './AccountScreen';
+import { accountUrl, bindAccount, request, RequestError, SESSION_CHANGED,
+  type Account, type Analysis, type Job, type LocalFile, type Message } from './api';
+import { ANALYSIS, Status, showSize } from './display';
+import { FileManager, TaskManager, ToolManager } from './Management';
+import { Navigation, useSection } from './Navigation';
 import { errorText, useWorkspace } from './useWorkspace';
 
-const STATES = { queued: '排队中', running: '运行中', succeeded: '成功', failed: '失败' };
-const ANALYSIS: Record<Analysis, string> = { seq_stats: '序列统计', find_orf: '最长 ORF' };
 const EXAMPLES = [
   { title: '统计 GC 含量', file: 'sample1.fasta', prompt: '帮我统计一下 sample1 里序列的 GC 含量。' },
   { title: '查找最长 ORF', file: 'sample2.fasta', prompt: '找出 sample2 中每条序列的最长 ORF。' },
@@ -19,10 +23,6 @@ function showTime(value: string): string {
   return date.toDateString() === today.toDateString()
     ? date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
     : date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
-}
-
-function showSize(bytes: number): string {
-  return bytes < 1024 ? bytes + ' B' : (bytes / 1024).toFixed(1) + ' KiB';
 }
 
 function pretty(raw: string): string {
@@ -173,10 +173,6 @@ function MessageView({ message, jobs, observations }: {
   );
 }
 
-function Status({ state }: { state: Job['state'] }) {
-  return <span className={'state-pill ' + state}><i />{STATES[state]}</span>;
-}
-
 function JobCards({ jobs, onRetry }: { jobs: Job[]; onRetry: (job: Job) => void }) {
   if (!jobs.length) return <p className="muted rail-empty">提交分析后，可在这里查看状态和日志。</p>;
   return (
@@ -192,8 +188,8 @@ function JobCards({ jobs, onRetry }: { jobs: Job[]; onRetry: (job: Job) => void 
           {job.runner_error && <div className="job-reason">{job.runner_error}</div>}
           {job.finished_at && <div className="job-actions">
             {(!job.runner_error || job.exit_code !== null) && <>
-              <a href={roomPath(job.conversation_id) + '/jobs/' + job.id + '/logs/stdout'}>输出日志</a>
-              <a href={roomPath(job.conversation_id) + '/jobs/' + job.id + '/logs/stderr'}>错误日志</a>
+              <a href={accountUrl('/api/jobs/' + job.id + '/logs/stdout')}>输出日志</a>
+              <a href={accountUrl('/api/jobs/' + job.id + '/logs/stderr')}>错误日志</a>
             </>}
             {job.summary_state === 'error' && <button onClick={() => onRetry(job)}>重新解释</button>}
           </div>}
@@ -204,7 +200,59 @@ function JobCards({ jobs, onRetry }: { jobs: Job[]; onRetry: (job: Job) => void 
 }
 
 export function App() {
-  const workspace = useWorkspace();
+  const [account, setAccount] = useState<Account | null>();
+  const [authError, setAuthError] = useState('');
+  const checkId = useRef(0);
+
+  const applyAccount = useCallback((user: Account | null) => {
+    checkId.current++;
+    bindAccount(user ?? undefined);
+    setAccount(user);
+    setAuthError('');
+  }, []);
+
+  const checkSession = useCallback(async () => {
+    const check = ++checkId.current;
+    try {
+      const user = await request<Account>('/api/auth/me');
+      if (check === checkId.current) applyAccount(user);
+    } catch (error) {
+      if (check !== checkId.current) return;
+      if (error instanceof RequestError && error.status === 401) applyAccount(null);
+      else setAuthError('无法连接本机服务，请确认后端已启动。');
+    }
+  }, [applyAccount]);
+
+  useEffect(() => {
+    void checkSession();
+    const check = () => { void checkSession(); };
+    window.addEventListener(SESSION_CHANGED, check);
+    window.addEventListener('focus', check);
+    return () => {
+      checkId.current++;
+      window.removeEventListener(SESSION_CHANGED, check);
+      window.removeEventListener('focus', check);
+    };
+  }, [checkSession]);
+
+  async function signOut() {
+    await request('/api/auth/logout', { method: 'POST' });
+    applyAccount(null);
+  }
+
+  if (account === undefined) {
+    return <main className="account-page"><div className="account-card">
+      <p role="status">{authError || '正在连接本机工作区…'}</p>
+      {authError && <button className="secondary-button" onClick={() => void checkSession()}>重试</button>}
+    </div></main>;
+  }
+  if (!account) return <AccountScreen onSignIn={applyAccount} />;
+  return <Workspace key={account.id} account={account} onLogout={signOut} />;
+}
+
+function Workspace({ account, onLogout }: { account: Account; onLogout: () => Promise<void> }) {
+  const workspace = useWorkspace(account.id);
+  const { section, navigate, label } = useSection();
   const { activeId, room, config } = workspace;
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [creating, setCreating] = useState(false);
@@ -217,7 +265,7 @@ export function App() {
   const scroll = useRef<HTMLDivElement>(null);
   const followEnd = useRef(true);
   const current = workspace.conversations.find(row => row.id === activeId);
-  const uploaded = room.files.filter(file => file.source === 'upload');
+  const uploaded = workspace.files.filter(file => file.source === 'upload');
   const history = room.messages;
   const draftKey = activeId || '';
   const draft = drafts[draftKey] ?? '';
@@ -230,15 +278,29 @@ export function App() {
     followEnd.current = true;
   }, [activeId]);
 
+  useEffect(() => {
+    setMobilePanel(null);
+  }, [section]);
+
+  useEffect(() => {
+    if (!mobilePanel) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMobilePanel(null);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [mobilePanel]);
+
   useLayoutEffect(() => {
     const target = scroll.current;
     if (target && followEnd.current) target.scrollTop = target.scrollHeight;
-  }, [activeId, history]);
+  }, [activeId, history, section]);
 
   function fill(text: string) {
     setDrafts(previous => ({ ...previous, [draftKey]: text }));
     setMobilePanel(null);
-    composer.current?.focus();
+    navigate('home');
+    requestAnimationFrame(() => composer.current?.focus());
   }
 
   async function create() {
@@ -246,8 +308,9 @@ export function App() {
     workspace.setNotice('');
     try {
       await workspace.create();
+      navigate('home');
       setMobilePanel(null);
-      composer.current?.focus();
+      requestAnimationFrame(() => composer.current?.focus());
     } catch (error) {
       workspace.setNotice(errorText(error));
     } finally {
@@ -257,11 +320,12 @@ export function App() {
 
   function choose(id: string) {
     followEnd.current = true;
+    navigate('home');
     setMobilePanel(null);
     workspace.select(id);
   }
 
-  function composerKey(event: KeyboardEvent<HTMLTextAreaElement>) {
+  function composerKey(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
       event.preventDefault();
       form.current?.requestSubmit();
@@ -294,11 +358,12 @@ export function App() {
     workspace.setNotice('');
     try {
       if (config && file.size > config.upload_limit) throw new Error('文件超过 5 MiB，请使用较小的 FASTA。');
-      const saved = await workspace.upload(file);
+      const conversationId = activeId ?? await workspace.create();
+      const saved = await workspace.upload(file, conversationId);
       setDrafts(previous => ({
         ...previous,
-        [saved.conversationId]: previous[saved.conversationId] ||
-          '帮我统计 ' + saved.file.display_name + ' 中每条序列的长度和 GC 含量。',
+        [conversationId]: previous[conversationId] ||
+          '帮我统计 ' + saved.display_name + ' 中每条序列的长度和 GC 含量。',
       }));
       composer.current?.focus();
     } catch (error) {
@@ -319,8 +384,11 @@ export function App() {
 
   return (
     <div className="workspace">
-      {mobilePanel && <button className="panel-overlay" aria-label="关闭侧栏" onClick={() => setMobilePanel(null)} />}
+      <Navigation section={section} onLogout={() => void onLogout().catch(error => workspace.setNotice(errorText(error)))} />
+      {mobilePanel && <div className="panel-overlay" aria-hidden="true" onClick={() => setMobilePanel(null)} />}
       <aside className={'sidebar ' + (mobilePanel === 'history' ? 'panel-visible' : '')} aria-label="历史会话">
+        {mobilePanel === 'history' && <button type="button" className="mobile-drawer-close"
+          aria-label="关闭会话侧栏" onClick={() => setMobilePanel(null)}><X size={18} aria-hidden="true" /></button>}
         <div className="brand">
           <div className="brand-mark" aria-hidden="true"><i /><i /><i /></div>
           <div>科研计算助手<span>本机工作区</span></div>
@@ -344,14 +412,17 @@ export function App() {
             );
           })}
         </div>
-        <div className="sidebar-footer"><span className="storage-mark" aria-hidden="true" /> 历史保存在本机</div>
+        <div className="sidebar-footer" title={account.username}>
+          <span className="account-initial" aria-hidden="true">{Array.from(account.username)[0].toUpperCase()}</span>
+          <span className="current-account">{account.username}</span>
+        </div>
       </aside>
 
       <div className="main-area">
         <header className="topbar">
           <div className="topbar-room">
             <button className="mobile-button" onClick={() => setMobilePanel('history')}>会话</button>
-            <div className="room-title" title={current?.title}>{current?.title || '新会话'}</div>
+            {section === 'home' && <div className="room-title" title={current?.title}>{current?.title || '新会话'}</div>}
           </div>
           <div className="topbar-status">
             <span className={'connection ' + workspace.connection}><i />
@@ -360,11 +431,11 @@ export function App() {
             <span className="model-label" title={config?.model}>
               {config?.model === 'deepseek-flash' || !config?.model ? 'DeepSeek Flash' : config.model}
             </span>
-            <button className="mobile-button" onClick={() => setMobilePanel('jobs')}>任务</button>
+            {section === 'home' && <button className="mobile-button" onClick={() => setMobilePanel('jobs')}>任务</button>}
           </div>
         </header>
 
-        <div className="body-grid">
+        {section === 'home' ? <div className="body-grid">
           <main className="chat" aria-label="聊天">
             {config && !config.key_configured && (
               <div className="config-banner">
@@ -429,6 +500,8 @@ export function App() {
           </main>
 
           <aside className={'rail ' + (mobilePanel === 'jobs' ? 'panel-visible' : '')} aria-label="附件和任务">
+            {mobilePanel === 'jobs' && <button type="button" className="mobile-drawer-close"
+              aria-label="关闭任务侧栏" onClick={() => setMobilePanel(null)}><X size={18} aria-hidden="true" /></button>}
             <section className="rail-section">
               <h2>样例文件</h2>
               <div className="file-list">
@@ -441,7 +514,7 @@ export function App() {
               </div>
             </section>
             {!!uploaded.length && <section className="rail-section uploads">
-              <h2>当前会话文件</h2>
+              <h2>我的文件</h2>
               <div className="file-list">
                 {uploaded.map(file => (
                   <button className="file" key={file.id} onClick={() => suggestFile(file)}>
@@ -456,7 +529,12 @@ export function App() {
               <JobCards jobs={room.jobs} onRetry={retry} />
             </section>
           </aside>
-        </div>
+        </div> : <main className="management" aria-label={label}>
+          {workspace.notice && <p className="management-notice tone-error" role="alert">{workspace.notice}</p>}
+          {section === 'files' && <FileManager files={workspace.files} onUpload={workspace.upload} onAnalyze={suggestFile} />}
+          {section === 'tasks' && <TaskManager jobs={workspace.jobs} onConversation={choose} />}
+          {section === 'tools' && <ToolManager />}
+        </main>}
       </div>
       {workspace.toast && <div className="toast" role="status">
         <span>{workspace.toast.text}</span>

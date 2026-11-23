@@ -1,7 +1,7 @@
 """Short SQLite transactions on the application event loop."""
 
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePath
 import json
 import sqlite3
 from uuid import uuid4
@@ -17,11 +17,24 @@ SCHEMA = """
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    username_key TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    owner_id TEXT REFERENCES users(id)
 );
 CREATE TABLE IF NOT EXISTS files (
     id TEXT PRIMARY KEY,
@@ -31,6 +44,8 @@ CREATE TABLE IF NOT EXISTS files (
     storage_name TEXT NOT NULL,
     source TEXT NOT NULL CHECK(source IN ('sample', 'upload')),
     size_bytes INTEGER NOT NULL,
+    owner_id TEXT REFERENCES users(id),
+    created_at TEXT,
     UNIQUE(conversation_id, name_key)
 );
 CREATE TABLE IF NOT EXISTS messages (
@@ -67,14 +82,17 @@ CREATE TABLE IF NOT EXISTS jobs (
     runner_error TEXT,
     summary_state TEXT NOT NULL DEFAULT 'pending',
     revision INTEGER NOT NULL DEFAULT 0,
+    input_name TEXT,
     UNIQUE(origin_message_id, file_id, analysis_type)
 );
 CREATE INDEX IF NOT EXISTS jobs_conversation ON jobs(conversation_id, created_at);
 """
 
 JOB_SELECT = """
-SELECT j.*, f.display_name AS filename
-FROM jobs j JOIN files f ON f.id = j.file_id
+SELECT j.*, COALESCE(j.input_name, f.display_name) AS filename, c.owner_id
+FROM jobs j
+JOIN files f ON f.id = j.file_id
+JOIN conversations c ON c.id = j.conversation_id
 """
 
 
@@ -83,6 +101,7 @@ class Store:
         self.db = sqlite3.connect(db_path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        self._upgrade()
         with self.db:
             for name in SAMPLES:
                 self.db.execute(
@@ -95,6 +114,27 @@ class Store:
     def close(self) -> None:
         self.db.close()
 
+    def _upgrade(self) -> None:
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            for table, name, declaration in (
+                ("conversations", "owner_id", "TEXT REFERENCES users(id)"),
+                ("files", "owner_id", "TEXT REFERENCES users(id)"),
+                ("files", "created_at", "TEXT"),
+                ("jobs", "input_name", "TEXT"),
+            ):
+                columns = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+            self.db.execute("CREATE INDEX IF NOT EXISTS conversations_owner ON conversations(owner_id, updated_at)")
+            self.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS files_owner_name ON files(owner_id, name_key) WHERE owner_id IS NOT NULL"
+            )
+            self.db.execute("""
+                UPDATE jobs SET input_name=(SELECT display_name FROM files WHERE id=jobs.file_id)
+                WHERE input_name IS NULL
+            """)
+
     def _one(self, sql: str, params: tuple = ()) -> dict | None:
         row = self.db.execute(sql, params).fetchone()
         return dict(row) if row else None
@@ -102,19 +142,52 @@ class Store:
     def _all(self, sql: str, params: tuple = ()) -> list[dict]:
         return [dict(row) for row in self.db.execute(sql, params)]
 
-    def new_conversation(self) -> dict:
+    def create_user(self, username: str, key: str, password_hash: str) -> dict:
+        user_id = uuid4().hex
+        with self.db:
+            self.db.execute(
+                "INSERT INTO users (id, username, username_key, password_hash, created_at) VALUES (?,?,?,?,?)",
+                (user_id, username, key, password_hash, now()),
+            )
+        return {"id": user_id, "username": username}
+
+    def user_by_name(self, key: str) -> dict | None:
+        return self._one("SELECT * FROM users WHERE username_key=?", (key,))
+
+    def create_session(self, user_id: str, token_hash: str, expires_at: int) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM sessions WHERE expires_at<=unixepoch()")
+            self.db.execute(
+                "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?,?,?)",
+                (token_hash, user_id, expires_at),
+            )
+
+    def session(self, token_hash: str) -> dict | None:
+        return self._one("""
+            SELECT u.id, u.username, s.expires_at FROM sessions s
+            JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>unixepoch()
+        """, (token_hash,))
+
+    def delete_session(self, token_hash: str) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash,))
+
+    def new_conversation(self, owner_id: str) -> dict:
         conversation_id, timestamp = uuid4().hex, now()
         with self.db:
             self.db.execute(
-                "INSERT INTO conversations VALUES (?, ?, ?, ?)",
-                (conversation_id, "新会话", timestamp, timestamp),
+                "INSERT INTO conversations (id, title, created_at, updated_at, owner_id) VALUES (?,?,?,?,?)",
+                (conversation_id, "新会话", timestamp, timestamp, owner_id),
             )
         return self.conversation(conversation_id)
 
     def conversation(self, conversation_id: str) -> dict | None:
         return self._one("SELECT * FROM conversations WHERE id=?", (conversation_id,))
 
-    def conversations(self) -> list[dict]:
+    def owned_conversation(self, owner_id: str, conversation_id: str) -> dict | None:
+        return self._one("SELECT * FROM conversations WHERE owner_id=? AND id=?", (owner_id, conversation_id))
+
+    def conversations(self, owner_id: str) -> list[dict]:
         return self._all("""
             SELECT c.*, a.last_finished_at, COALESCE(a.active_jobs, 0) AS active_jobs
             FROM conversations c
@@ -123,29 +196,37 @@ class Store:
                     SUM(state IN ('queued', 'running')) AS active_jobs
                 FROM jobs GROUP BY conversation_id
             ) a ON a.conversation_id = c.id
+            WHERE c.owner_id=?
             ORDER BY c.updated_at DESC
-        """)
+        """, (owner_id,))
 
-    def files(self, conversation_id: str) -> list[dict]:
+    def files(self, owner_id: str) -> list[dict]:
         return self._all(
-            "SELECT * FROM files WHERE conversation_id IS NULL OR conversation_id=? ORDER BY source, rowid",
-            (conversation_id,),
+            "SELECT * FROM files WHERE source='sample' OR owner_id=? ORDER BY source, rowid",
+            (owner_id,),
         )
 
     def file(self, file_id: str) -> dict | None:
         return self._one("SELECT * FROM files WHERE id=?", (file_id,))
 
-    def add_file(self, conversation_id: str, file_id: str, name: str, size: int) -> dict:
+    def owned_file(self, owner_id: str, file_id: str) -> dict | None:
+        return self._one(
+            "SELECT * FROM files WHERE id=? AND (owner_id=? OR source='sample')", (file_id, owner_id),
+        )
+
+    def add_file(self, owner_id: str, file_id: str, name: str, size: int, conversation_id: str | None = None) -> dict:
         with self.db:
             self.db.execute(
-                """INSERT INTO files VALUES (?, ?, ?, ?, ?, 'upload', ?)""",
-                (file_id, conversation_id, name, name.casefold(), file_id, size),
+                """INSERT INTO files
+                   (id, conversation_id, display_name, name_key, storage_name, source, size_bytes, owner_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, 'upload', ?, ?, ?)""",
+                (file_id, conversation_id, name, name.casefold(), file_id, size, owner_id, now()),
             )
         return self.file(file_id)
 
     @staticmethod
     def public_file(row: dict) -> dict:
-        return {key: row[key] for key in ("id", "display_name", "source", "size_bytes")}
+        return {key: row[key] for key in ("id", "display_name", "source", "size_bytes", "created_at")}
 
     @staticmethod
     def public_message(row: dict) -> dict:
@@ -248,14 +329,17 @@ class Store:
             for row in reversed(rows) if row["content"]
         ]
 
-    def snapshot(self, conversation_id: str) -> dict:
+    def snapshot(self, owner_id: str, conversation_id: str) -> dict | None:
+        conversation = self.owned_conversation(owner_id, conversation_id)
+        if not conversation:
+            return None
         return {
-            "conversation": self.conversation(conversation_id),
+            "conversation": conversation,
             "messages": [self.public_message(row) for row in self._all(
                 "SELECT * FROM messages WHERE conversation_id=? ORDER BY id", (conversation_id,)
             )],
             "jobs": self._all(JOB_SELECT + " WHERE j.conversation_id=? ORDER BY j.created_at DESC", (conversation_id,)),
-            "files": [self.public_file(row) for row in self.files(conversation_id)],
+            "files": [self.public_file(row) for row in self.files(owner_id)],
         }
 
     def recent_jobs(self, conversation_id: str, before_user_id: int) -> list[dict]:
@@ -267,6 +351,12 @@ class Store:
     def job(self, job_id: str) -> dict | None:
         return self._one(JOB_SELECT + " WHERE j.id=?", (job_id,))
 
+    def owned_job(self, owner_id: str, job_id: str) -> dict | None:
+        return self._one(JOB_SELECT + " WHERE c.owner_id=? AND j.id=?", (owner_id, job_id))
+
+    def jobs(self, owner_id: str) -> list[dict]:
+        return self._all(JOB_SELECT + " WHERE c.owner_id=? ORDER BY j.created_at DESC", (owner_id,))
+
     def jobs_with_prefix(self, conversation_id: str, prefix: str) -> list[dict]:
         return self._all(
             JOB_SELECT + " WHERE j.conversation_id=? AND j.id LIKE ? LIMIT 2", (conversation_id, prefix + "%")
@@ -276,10 +366,10 @@ class Store:
         job_id = uuid4().hex
         with self.db:
             cursor = self.db.execute(
-                """INSERT INTO jobs (id, conversation_id, origin_message_id, file_id, analysis_type, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?)
+                """INSERT INTO jobs (id, conversation_id, origin_message_id, file_id, analysis_type, created_at, input_name)
+                   VALUES (?, ?, ?, ?, ?, ?, (SELECT display_name FROM files WHERE id=?))
                    ON CONFLICT(origin_message_id, file_id, analysis_type) DO NOTHING""",
-                (job_id, conversation_id, turn_id, file_id, analysis_type, now()),
+                (job_id, conversation_id, turn_id, file_id, analysis_type, now(), file_id),
             )
             if not cursor.rowcount:
                 row = self._one(
@@ -341,4 +431,28 @@ class Store:
                 WHERE kind='invocation' AND status='done' AND json_array_length(tool_calls) >
                     (SELECT COUNT(*) FROM messages result WHERE result.invocation_id=messages.id)
             """)
-        return self._all(JOB_SELECT + " WHERE j.summary_state='pending' AND j.state IN ('succeeded', 'failed')")
+        return self._all(JOB_SELECT + """
+            WHERE c.owner_id IS NOT NULL AND j.summary_state='pending' AND j.state IN ('succeeded', 'failed')
+        """)
+
+    def assign_legacy(self, owner_id: str) -> tuple[int, int]:
+        """Associate a previous single-user workspace with an explicit local account."""
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            used = {row["name_key"] for row in self.files(owner_id)}
+            uploads = self._all("SELECT * FROM files WHERE owner_id IS NULL AND source='upload' ORDER BY rowid")
+            for file in uploads:
+                name = file["display_name"]
+                path = PurePath(name)
+                index = 1
+                while name.casefold() in used:
+                    index += 1
+                    suffix = f"-{index}{path.suffix}"
+                    name = path.stem[:120 - len(suffix)] + suffix
+                used.add(name.casefold())
+                self.db.execute(
+                    "UPDATE files SET owner_id=?, display_name=?, name_key=? WHERE id=?",
+                    (owner_id, name, name.casefold(), file["id"]),
+                )
+            conversations = self.db.execute("UPDATE conversations SET owner_id=? WHERE owner_id IS NULL", (owner_id,))
+        return conversations.rowcount, len(uploads)

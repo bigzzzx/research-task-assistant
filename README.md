@@ -24,7 +24,7 @@ if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 .\.venv\Scripts\python.exe -m uvicorn backend.app.api:app --host 127.0.0.1 --port 8767 --timeout-graceful-shutdown 3
 ```
 
-在浏览器打开 [本机工作区](http://127.0.0.1:8767)。修改 `.env` 后重启服务。Key 留空时仍可打开工作区，页面会提示如何配置。在启用 API 后，聊天文本和限长的工具结果会发给 DeepSeek 用来理解请求和生成解释，FASTA 文件由本机脚本读取。
+在浏览器打开 [本机工作区](http://127.0.0.1:8767)，点击“创建账号”注册并登录。密码至少 15 个字符。修改 `.env` 后重启服务。Key 留空时可以登录和管理文件，聊天区会提示如何配置。在启用 API 后，聊天文本和限长的工具结果会发给 DeepSeek，FASTA 文件由本机脚本读取。
 
 ### macOS 或 Linux
 
@@ -37,6 +37,23 @@ test -f .env || cp .env.example .env
 ```
 
 按同样方式填写 `.env`，再运行 `.venv/bin/python -m uvicorn backend.app.api:app --host 127.0.0.1 --port 8767 --timeout-graceful-shutdown 3`。开发界面时可另开终端执行 `npm --prefix frontend run dev`，在 `http://127.0.0.1:5173` 打开 Vite 页面，API 仍走 8767。
+
+## 账号和工作区
+
+- **首页**保留历史会话、流式聊天、工具记录和当前会话任务。
+- **文件管理**支持上传、下载和将文件带入聊天分析。每个账号有自己的上传文件，同一账号可跨会话复用。三个内置题面样例供各账号使用。
+- **任务管理**按账号展示全部任务。可按状态筛选，按文件名或完整 ID 搜索。详情显示执行时间、退出码、标准输出和错误日志。长日志可以逐段阅读，任务结束后可下载完整文件。
+- **工具管理**展示当前可调用的 `submit_job`、`job_status` 和 `read_log` 的用途及参数。
+
+账号密码以带随机盐的 scrypt 哈希保存，浏览器使用会过期的 HttpOnly 会话 Cookie。SQLite 根据会话所属账号筛选文件、对话、任务和日志，实时事件也按账号推送。[OWASP 密码存储](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) · [OWASP 会话管理](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)
+
+导航图标使用 Lucide，任务详情参考了科研作业管理中同时呈现状态、退出码和原始日志的设计。[Lucide 图标](https://lucide.dev/icons) · [Seqera 运行详情](https://docs.seqera.io/platform-cloud/getting-started/quickstart-demo/view-run-information)
+
+如果从旧的单用户版本升级，已有记录保留在原数据库中。确认整套旧记录归属同一个账号后，可在先注册该账号并备份 `var/` 的前提下，用本机命令将记录关联到它。旧文件重名时自动加数字后缀，任务记录保留提交时使用的文件名。
+
+```powershell
+.\.venv\Scripts\python.exe -m backend.app.assign_legacy -- 你的用户名
+```
 
 ## 演示路径
 
@@ -67,7 +84,7 @@ flowchart LR
 
 - `backend/app/model.py` 解析 DeepSeek 流式正文、按索引拼齐工具参数。`backend/app/agent.py` 执行并回填 `tool_call_id` 对应的结果。每阶段最多调用模型 6 轮。DeepSeek 的模型思考模式使用关闭配置，调用工具和消费结果的 ReAct 循环由应用实现。
 - `backend/app/jobs.py` 本地最多同时执行两个任务。每个脚本内部延时 4 秒，提交立即返回，单任务上限默认 60 秒。任务的退出码和输出由后端记录。任务结束时，助手查询同一个 ID，再读日志生成解释。
-- `backend/app/store.py` 管理 SQLite 中的会话、消息、工具记录、文件登记和任务。相同客户端消息的重发使用同一消息 ID，重复工具提交复用同一任务。重启时无法确认的在途任务标为中断，待解释的终态可从原日志恢复。
+- `backend/app/store.py` 管理 SQLite 中的账号与会话凭证、对话、工具记录、文件登记和任务。相同客户端消息的重发使用同一消息 ID，重复工具提交复用同一任务。重启时无法确认的在途任务标为中断，待解释的终态可从原日志恢复。
 - `scripts/` 放两个可单独运行的脚本。统计以 A、C、G、T 为 GC 分母，IUPAC 歧义碱基计入总长度。ORF 取正链三个阅读框中最长的完整 `ATG` 到同框终止区间，坐标从 1 开始、含两端，等长取较早起点。`sample3` 的两处错误由同一个共享解析器收集。
 - `frontend/` 通过一个 SSE 连接接收消息增量、工具轨迹和任务通知。断线后从 SQLite 快照恢复。`var/` 保存 SQLite、上传文件和两路原始日志，工具预览每路最多约 8 KiB。任务记录可下载完整日志。模型调用失败时，系统仍能读取本机日志，并提供“重新解释”。
 
@@ -80,7 +97,7 @@ flowchart LR
 npm --prefix frontend run build
 ```
 
-测试使用可控的模型流式响应，实际运行本机分析子进程和 SQLite。重点覆盖四条样例结果、坏文件、分片工具参数、异步运行、重复请求、会话恢复、超时和上传。真实模型联调使用上面的演示路径，需要自己的 Key。
+测试使用可控的模型流式响应，实际运行本机分析子进程和 SQLite。覆盖样例结果、坏文件、异步运行、会话恢复、注册退出、跨账号访问、实时事件隔离和完整日志读取。真实模型联调使用上面的演示路径，需要自己的 Key。
 
 ## 打包
 
