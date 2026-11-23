@@ -11,7 +11,7 @@ from backend.app.config import ROOT, Settings
 from backend.app.events import Events
 from backend.app.store import Store
 from tests.model_fixture import ModelFixture
-from tests.test_app import TEST_PASSWORD, application, client_for, create_room, send, sign_in, terminal, until
+from tests.test_app import application, client_for, create_room, send, sign_in, terminal, until
 
 
 class AccountTests(IsolatedAsyncioTestCase):
@@ -26,11 +26,13 @@ class AccountTests(IsolatedAsyncioTestCase):
             async with client_for(app) as client:
                 for path in ("/api/conversations", "/api/config", "/api/events", "/api/tools", "/api/jobs", "/api/files"):
                     self.assertEqual((await client.get(path)).status_code, 401, path)
-                short = await client.post("/api/auth/register", json={"username": "研究员甲", "password": "too-short"})
+                short_password = "123456"
+                short = await client.post("/api/auth/register", json={"username": "研究员甲", "password": short_password})
                 self.assertEqual(short.status_code, 422)
-                self.assertNotIn("too-short", short.text)
+                self.assertEqual(short.json()["detail"], "密码至少 7 位。")
+                self.assertNotIn(short_password, short.text)
 
-                credentials = {"username": "Alice-01", "password": TEST_PASSWORD}
+                credentials = {"username": "Alice-01", "password": "1234567"}
                 registered = await client.post("/api/auth/register", json=credentials)
                 self.assertEqual(registered.status_code, 201)
                 self.assertEqual(set(registered.json()), {"id", "username"})
@@ -39,7 +41,7 @@ class AccountTests(IsolatedAsyncioTestCase):
                 self.assertEqual(registered.headers["cache-control"], "no-store")
                 saved = app.state.store.user_by_name("alice-01")["password_hash"]
                 self.assertTrue(saved.startswith("scrypt1$"))
-                self.assertNotIn(TEST_PASSWORD, saved)
+                self.assertNotEqual(saved, credentials["password"])
                 old_token = client.cookies.get(COOKIE)
                 self.assertEqual((await client.get("/api/auth/me")).json(), registered.json())
                 self.assertEqual((await client.post("/api/auth/logout")).status_code, 204)

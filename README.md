@@ -24,7 +24,7 @@ if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 .\.venv\Scripts\python.exe -m uvicorn backend.app.api:app --host 127.0.0.1 --port 8767 --timeout-graceful-shutdown 3
 ```
 
-在浏览器打开 [本机工作区](http://127.0.0.1:8767)，点击“创建账号”注册并登录。密码至少 15 个字符。修改 `.env` 后重启服务。Key 留空时可以登录和管理文件，聊天区会提示如何配置。在启用 API 后，聊天文本和限长的工具结果会发给 DeepSeek，FASTA 文件由本机脚本读取。
+在浏览器打开 [本机工作区](http://127.0.0.1:8767)，点击“创建账号”注册并登录。密码至少 7 位。修改 `.env` 后重启服务。Key 留空时可以登录和管理文件，聊天区会提示如何配置。在启用 API 后，聊天文本和限长的工具结果会发给 DeepSeek，FASTA 文件由本机脚本读取。
 
 ### macOS 或 Linux
 

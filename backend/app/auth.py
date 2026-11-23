@@ -96,8 +96,8 @@ def credentials(body: Credentials) -> tuple[str, str, bytes]:
 @router.post("/register", status_code=201)
 async def register(body: Credentials, request: Request, response: Response):
     name, key, password = credentials(body)
-    if len(body.password) < 15:
-        raise HTTPException(422, "请设置至少 15 个字符的密码。")
+    if len(body.password) < 7:
+        raise HTTPException(422, "密码至少 7 位。")
 
     salt = token_bytes(16)
     async with request.app.state.password_slots:

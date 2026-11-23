@@ -51,9 +51,9 @@ export function AccountScreen({ onSignIn }: { onSignIn: (account: Account) => vo
         <input id="account-password" type="password" value={password}
           autoComplete={registering ? 'new-password' : 'current-password'}
           aria-describedby={registering ? 'password-hint' : undefined}
-          onChange={event => setPassword(event.target.value)} minLength={registering ? 15 : 1}
+          onChange={event => setPassword(event.target.value)} minLength={registering ? 7 : 1}
           maxLength={128} required />
-        {registering && <p className="account-hint" id="password-hint">至少 15 个字符，可以使用一段容易记住的短语。</p>}
+        {registering && <p className="account-hint" id="password-hint">密码至少 7 位。</p>}
         {error && <p className="account-error" role="alert">{error}</p>}
         <button className="primary-button" type="submit" disabled={busy}>
           {busy ? '正在处理' : registering ? '注册并登录' : '登录'}
