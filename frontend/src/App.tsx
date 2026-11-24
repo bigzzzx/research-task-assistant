@@ -4,9 +4,11 @@ import { X } from 'lucide-react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { AccountScreen } from './AccountScreen';
+import { AccountPreferences } from './AccountPreferences';
 import { accountUrl, bindAccount, request, RequestError, SESSION_CHANGED,
   type Account, type Analysis, type Job, type LocalFile, type Message } from './api';
 import { ANALYSIS, Status, showSize } from './display';
+import { InputRecovery } from './InputRecovery';
 import { FileManager, TaskManager, ToolManager } from './Management';
 import { Navigation, useSection } from './Navigation';
 import { errorText, useWorkspace } from './useWorkspace';
@@ -33,12 +35,21 @@ function pretty(raw: string): string {
   }
 }
 
-type StatsRow = { id: string; length_nt: number; gc_pct: number | null };
+type StatsRow = {
+  id: string;
+  length_nt: number;
+  gc_pct?: number | null;
+  gc_display?: string | null;
+  gc_count?: number;
+  known_bases?: number;
+};
 type OrfRow = { id: string; orf: { start: number; end: number; length_nt: number } | null };
 type ToolOutput = {
   ok: boolean;
   stdout?: string;
   stderr?: string;
+  display_stdout?: string;
+  gc_precision_note?: string;
   job_id?: string;
   state?: Job['state'];
   analysis_type?: Analysis;
@@ -55,18 +66,18 @@ function asOutput(message?: Message): ToolOutput | undefined {
   }
 }
 
-function ResultTable({ output }: { output: ToolOutput }) {
+function ResultTable({ log, analysisType }: { log?: string; analysisType?: Analysis }) {
   const rows: (StatsRow | OrfRow)[] = [];
-  for (const line of output.stdout?.split('\n') ?? []) {
+  for (const line of log?.split('\n') ?? []) {
     try {
       const row = JSON.parse(line);
-      if (typeof row?.id === 'string' && ('gc_pct' in row || 'orf' in row)) rows.push(row);
+      if (typeof row?.id === 'string' && ('gc_pct' in row || 'gc_display' in row || 'orf' in row)) rows.push(row);
     } catch {
       // A truncated preview can contain a partial record.
     }
   }
   if (!rows.length) return null;
-  const stats = output.analysis_type === 'seq_stats';
+  const stats = analysisType === 'seq_stats';
   return (
     <div className="result-wrap">
       <table className="results">
@@ -74,12 +85,18 @@ function ResultTable({ output }: { output: ToolOutput }) {
         <tbody>{rows.map((row, index) => (
           <tr key={index}>
             <td>{row.id}</td>
-            {'gc_pct' in row ? <>
-              <td>{row.length_nt}</td>
-              <td>{row.gc_pct === null ? '无法计算' : row.gc_pct.toFixed(2) + '%'}</td>
-            </> : <>
+            {'orf' in row ? <>
               <td>{row.orf ? row.orf.start + '–' + row.orf.end : '无完整 ORF'}</td>
               <td>{row.orf?.length_nt ?? '—'}</td>
+            </> : <>
+              <td>{row.length_nt}</td>
+              <td>
+                {row.gc_display ?? (typeof row.gc_pct === 'number' ? row.gc_pct.toFixed(2) + '%' : '无法计算')}
+                {row.gc_count != null && !!row.known_bases &&
+                  <small className="result-basis" aria-label="G 和 C 的数量 / 确定碱基数">
+                    {row.gc_count}/{row.known_bases}
+                  </small>}
+              </td>
             </>}
           </tr>
         ))}</tbody>
@@ -89,10 +106,11 @@ function ResultTable({ output }: { output: ToolOutput }) {
 }
 
 function LogResult({ output }: { output: ToolOutput }) {
-  const { stdout, stderr, ...fields } = output;
+  const { stdout, stderr, display_stdout, gc_precision_note, ...fields } = output;
   return (
     <>
-      <ResultTable output={output} />
+      <ResultTable log={display_stdout ?? stdout} analysisType={output.analysis_type} />
+      {gc_precision_note && <p className="preview-note">{gc_precision_note}</p>}
       {(output.stdout_truncated || output.stderr_truncated) && (
         <p className="preview-note">预览已截断。可在任务记录下载完整日志。</p>
       )}
@@ -258,6 +276,7 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
   const [creating, setCreating] = useState(false);
   const [posting, setPosting] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [showPreferences, setShowPreferences] = useState(false);
   const [mobilePanel, setMobilePanel] = useState<'history' | 'jobs' | null>(null);
   const composer = useRef<HTMLTextAreaElement>(null);
   const form = useRef<HTMLFormElement>(null);
@@ -294,7 +313,7 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
   useLayoutEffect(() => {
     const target = scroll.current;
     if (target && followEnd.current) target.scrollTop = target.scrollHeight;
-  }, [activeId, history, section]);
+  }, [activeId, history, room.input_requests, section]);
 
   function fill(text: string) {
     setDrafts(previous => ({ ...previous, [draftKey]: text }));
@@ -391,7 +410,7 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
           aria-label="关闭会话侧栏" onClick={() => setMobilePanel(null)}><X size={18} aria-hidden="true" /></button>}
         <div className="brand">
           <div className="brand-mark" aria-hidden="true"><i /><i /><i /></div>
-          <div>科研计算助手<span>本机工作区</span></div>
+          <div>科研计算助手</div>
         </div>
         <button className="new-chat" disabled={creating} onClick={create}>
           <span aria-hidden="true">＋</span> 新建会话
@@ -415,24 +434,17 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
         <div className="sidebar-footer" title={account.username}>
           <span className="account-initial" aria-hidden="true">{Array.from(account.username)[0].toUpperCase()}</span>
           <span className="current-account">{account.username}</span>
+          <button type="button" className="preferences-link" onClick={() => setShowPreferences(true)}>分析偏好</button>
         </div>
       </aside>
 
       <div className="main-area">
-        <header className="topbar">
+        <header className={section === 'home' ? 'topbar' : 'topbar mobile-topbar'}>
           <div className="topbar-room">
             <button className="mobile-button" onClick={() => setMobilePanel('history')}>会话</button>
             {section === 'home' && <div className="room-title" title={current?.title}>{current?.title || '新会话'}</div>}
           </div>
-          <div className="topbar-status">
-            <span className={'connection ' + workspace.connection}><i />
-              {workspace.connection === 'online' ? '本机已连接' : workspace.connection === 'retrying' ? '正在重连' : '连接中'}
-            </span>
-            <span className="model-label" title={config?.model}>
-              {config?.model === 'deepseek-flash' || !config?.model ? 'DeepSeek Flash' : config.model}
-            </span>
-            {section === 'home' && <button className="mobile-button" onClick={() => setMobilePanel('jobs')}>任务</button>}
-          </div>
+          {section === 'home' && <button className="mobile-button" onClick={() => setMobilePanel('jobs')}>任务</button>}
         </header>
 
         {section === 'home' ? <div className="body-grid">
@@ -464,6 +476,10 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
                   <div className="message-stack" aria-label="会话记录">
                     {history.map(message => (
                       <MessageView key={message.id} message={message} jobs={room.jobs} observations={observations} />
+                    ))}
+                    {room.input_requests.map(input => (
+                      <InputRecovery key={input.id} input={input} files={workspace.files}
+                        onUpload={workspace.upload} onResolve={workspace.resolveInput} />
                     ))}
                     {pending > 0 && <div className="pending-line" role="status">
                       <span className="typing" aria-hidden="true"><i /><i /><i /></span>
@@ -532,10 +548,11 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
         </div> : <main className="management" aria-label={label}>
           {workspace.notice && <p className="management-notice tone-error" role="alert">{workspace.notice}</p>}
           {section === 'files' && <FileManager files={workspace.files} onUpload={workspace.upload} onAnalyze={suggestFile} />}
-          {section === 'tasks' && <TaskManager jobs={workspace.jobs} onConversation={choose} />}
+          {section === 'tasks' && <TaskManager jobs={workspace.jobs} onConversation={choose} onRetry={workspace.retryJob} />}
           {section === 'tools' && <ToolManager />}
         </main>}
       </div>
+      {showPreferences && <AccountPreferences onClose={() => setShowPreferences(false)} />}
       {workspace.toast && <div className="toast" role="status">
         <span>{workspace.toast.text}</span>
         <button onClick={() => choose(workspace.toast!.conversationId)}>查看会话</button>

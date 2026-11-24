@@ -82,7 +82,7 @@ class AccountTests(IsolatedAsyncioTestCase):
                 bob_message = await send(bob, bob_room, "bob-turn", "帮我统计 alpha.fa")
                 await until(bob, bob_room, lambda snapshot: any(message["kind"] == "assistant" for message in snapshot["messages"]))
                 self.assertNotIn("alpha.fa", self.model.requests[-1]["messages"][0]["content"])
-                refused = app.state.tools.execute(
+                refused = await app.state.tools.execute(
                     bob_user["id"], bob_room.rsplit("/", 1)[1], bob_message["id"], "submit_job",
                     json.dumps({"filename": "alpha.fa", "analysis_type": "seq_stats"}),
                 )

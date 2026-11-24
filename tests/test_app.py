@@ -120,6 +120,16 @@ class ApplicationTests(IsolatedAsyncioTestCase):
             self.assertEqual([result["state"] for result in results], ["queued", "failed", "failed"])
             issues = [json.loads(line)["code"] for line in results[-1]["stderr"].splitlines()]
             self.assertEqual(issues, ["MISSING_HEADER", "INVALID_BASE"])
+            pending = final["input_requests"][0]
+            diagnostic_url = f"/api/input-requests/{pending['id']}/diagnostics"
+            diagnostics = (await client.get(diagnostic_url)).raise_for_status().json()
+            self.assertIsNone(diagnostics["repair"])
+            missing, invalid = diagnostics["issues"]
+            self.assertEqual(missing["columns"], [[1, 1]])
+            self.assertEqual(invalid["columns"], [[7, 9], [16, 18]])
+            self.assertEqual(invalid["excerpts"][0]["text"][6:9], "XXX")
+            self.assertEqual(invalid["excerpts"][0]["text"][15:18], "123")
+            self.assertNotIn("excerpts", results[-1]["stderr"])
             summaries = [message for message in final["messages"] if message["kind"] == "summary"]
             self.assertEqual(len(summaries), 2)
             self.assertIn("61.70%", summaries[0]["content"])

@@ -19,10 +19,12 @@ from .agent import Agent
 from .auth import Account, current_account, router as auth_router
 from .config import ROOT, SAMPLES, UPLOAD_LIMIT, Settings
 from .events import Events
+from .input_repair import FormatRepair, input_diagnostics, preview_repair
 from .jobs import Jobs, TERMINAL, log_page, registered_input
+from .mcp_tools import open_tool_client
 from .model import DeepSeek
 from .store import Store
-from .tools import Tools, tool_schemas
+from .tools import Tools, find_job
 
 SUFFIXES = {".fa", ".fasta", ".fna"}
 SignedIn = Annotated[Account, Depends(current_account)]
@@ -32,6 +34,16 @@ LogStream = Literal["stdout", "stderr"]
 class SendMessage(BaseModel):
     client_message_id: str = Field(min_length=1, max_length=80)
     text: str = Field(min_length=1, max_length=4000)
+
+
+class OutputPreferences(BaseModel):
+    result_order: Literal["file", "sequence_id"] | None = None
+    gc_decimal_places: int | None = Field(default=None, ge=0, le=2, strict=True)
+
+
+class ResolveInput(BaseModel):
+    file_id: str | None = Field(default=None, min_length=1, max_length=120)
+    repair_token: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 def create_app(
@@ -47,20 +59,22 @@ def create_app(
         store = Store(resolved.data_dir / "assistant.sqlite3", ROOT / "data")
         events = Events()
         model = DeepSeek(resolved, model_transport)
-        agent = Agent(store, events, model)
-        jobs = Jobs(resolved, store, events, lambda job: agent.complete(job, tools))
-        tools = Tools(store, jobs)
-        app.state.settings, app.state.events, app.state.store = resolved, events, store
-        app.state.agent, app.state.jobs, app.state.tools = agent, jobs, tools
-        app.state.password_slots = asyncio.Semaphore(2)
+        jobs = Jobs(resolved, store, events, lambda job: agent.complete(job))
         try:
-            for pending in store.recover():
-                agent.complete(pending, tools)
-            jobs.start()
-            yield
+            async with open_tool_client(Tools(store, jobs)) as tools:
+                agent = Agent(store, events, model, tools)
+                app.state.settings, app.state.events, app.state.store = resolved, events, store
+                app.state.agent, app.state.jobs, app.state.tools = agent, jobs, tools
+                app.state.password_slots = asyncio.Semaphore(2)
+                try:
+                    for pending in store.recover():
+                        agent.complete(pending)
+                    jobs.start()
+                    yield
+                finally:
+                    await jobs.close()
+                    await agent.close()
         finally:
-            await jobs.close()
-            await agent.close()
             events.close()
             await model.close()
             store.close()
@@ -99,6 +113,14 @@ def create_app(
         return {"model": resolved.model, "key_configured": bool(resolved.api_key),
                 "samples": list(SAMPLES), "upload_limit": UPLOAD_LIMIT}
 
+    @app.get("/api/preferences", response_model=OutputPreferences)
+    async def output_preferences(account: SignedIn):
+        return app.state.store.output_preferences(account.id)
+
+    @app.post("/api/preferences", response_model=OutputPreferences)
+    async def save_output_preferences(body: OutputPreferences, account: SignedIn):
+        return app.state.store.save_output_preferences(account.id, body.result_order, body.gc_decimal_places)
+
     @app.get("/api/conversations")
     async def conversations(account: SignedIn):
         return app.state.store.conversations(account.id)
@@ -125,7 +147,7 @@ def create_app(
         message, created = app.state.store.user_message(conversation_id, body.client_message_id, text)
         if created:
             app.state.events.send(account.id, "message.updated", message)
-            app.state.agent.chat(account.id, message, app.state.tools)
+            app.state.agent.chat(account.id, message)
         return message
 
     @app.get("/api/events")
@@ -211,6 +233,111 @@ def create_app(
     async def job_detail(job_id: str, account: SignedIn):
         return job_or_404(account, job_id)
 
+    @app.post("/api/jobs/{job_id}/retry", status_code=202)
+    async def retry_job(job_id: str, account: SignedIn):
+        original = job_or_404(account, job_id)
+        if original["state"] != "failed":
+            raise HTTPException(409, "只有已失败的任务可以重新运行。")
+        if original["input_request_id"] and not original["next_attempt_id"]:
+            raise HTTPException(409, "请在原会话选择修正后的文件，再继续分析。")
+        job, created = app.state.store.retry_job(original)
+        if created:
+            app.state.events.send(account.id, "job.updated", app.state.store.job(job_id))
+            app.state.jobs.enqueue(job)
+        return job
+
+    def input_or_404(account: Account, input_id: str) -> dict:
+        pending = app.state.store.owned_input_request(account.id, input_id)
+        if not pending:
+            raise HTTPException(404, "找不到待补充文件的记录。")
+        return pending
+
+    def original_input(account: Account, pending: dict) -> Path | None:
+        file = app.state.store.owned_file(account.id, pending["original_file_id"])
+        if not file:
+            return None
+        try:
+            return registered_input(app.state.settings.data_dir, file)
+        except OSError:
+            return None
+
+    async def repair_for(account: Account, pending: dict) -> FormatRepair | None:
+        if pending["resolved_job_id"] or pending["failure_code"] != "MISSING_HEADER":
+            return None
+        source = original_input(account, pending)
+        return await asyncio.to_thread(preview_repair, source) if source else None
+
+    def repair_response(repair: FormatRepair | None) -> dict | None:
+        return {"token": repair.token, "line": repair.line, "before": repair.before, "after": repair.after} if repair else None
+
+    @app.get("/api/input-requests/{input_id}/diagnostics")
+    async def failure_diagnostics(input_id: str, account: SignedIn):
+        pending = input_or_404(account, input_id)
+        if not pending["failed_job_id"]:
+            return {"issues": [], "truncated": False, "repair": None}
+        log_path = app.state.jobs.log_path(pending["failed_job_id"], "stderr")
+        diagnostics = await asyncio.to_thread(input_diagnostics, log_path, original_input(account, pending))
+        repair = await repair_for(account, pending)
+        return {**diagnostics, "repair": repair_response(repair)}
+
+    @app.get("/api/input-requests/{input_id}/repair")
+    async def input_repair(input_id: str, account: SignedIn):
+        return repair_response(await repair_for(account, input_or_404(account, input_id)))
+
+    @app.post("/api/input-requests/{input_id}/resolve", status_code=202)
+    async def resolve_input(input_id: str, body: ResolveInput, account: SignedIn):
+        pending = input_or_404(account, input_id)
+        store = app.state.store
+        if pending["resolved_job_id"]:
+            return {"input_request": pending, "job": store.job(pending["resolved_job_id"]), "file": None}
+        if bool(body.file_id) == bool(body.repair_token):
+            raise HTTPException(422, "请选择一份文件，或确认已预览的修复。")
+        if body.repair_token:
+            repair = await repair_for(account, pending)
+            if not repair or repair.token != body.repair_token:
+                raise HTTPException(409, "修复预览已失效，请重新预览或上传修正版。")
+            if not store.session(account.token_hash):
+                raise HTTPException(401, "登录已失效，请重新登录后确认修复。")
+            file_id = uuid4().hex
+            filename = PurePath(pending["filename"])
+            name = f"{filename.stem[:90]}-修复-{file_id[:10]}{filename.suffix}"
+            target = app.state.settings.data_dir / "uploads" / file_id
+            wrote = False
+            try:
+                with target.open("xb") as output:
+                    wrote = True
+                    output.write(repair.content)
+                updated, job, created = store.resolve_input(account.id, input_id, file_id,
+                                                            repaired_file=(name, len(repair.content)))
+            except OSError:
+                raise HTTPException(503, "无法保存格式修复副本。") from None
+            finally:
+                if wrote and not store.file(file_id):
+                    target.unlink(missing_ok=True)
+            saved = store.file(file_id)
+            public = store.public_file(saved) if saved else None
+            if public:
+                app.state.events.send(account.id, "file.added", {"file": public})
+        else:
+            file = store.owned_file(account.id, body.file_id)
+            if not file:
+                raise HTTPException(404, "文件不存在。")
+            if file["id"] == pending["original_file_id"]:
+                raise HTTPException(409, "请选择修正后的文件，也可以上传一份副本。")
+            try:
+                registered_input(app.state.settings.data_dir, file)
+            except OSError:
+                raise HTTPException(409, "所选文件无法读取，请重新上传。") from None
+            updated, job, created = store.resolve_input(account.id, input_id, file["id"])
+            public = None
+
+        app.state.events.send(account.id, "input.updated", updated)
+        if created:
+            if updated["failed_job_id"]:
+                app.state.events.send(account.id, "job.updated", store.job(updated["failed_job_id"]))
+            app.state.jobs.enqueue(job)
+        return {"input_request": updated, "job": job, "file": public}
+
     @app.get("/api/jobs/{job_id}/logs/{stream}/content")
     async def job_log_page(job_id: str, stream: LogStream, account: SignedIn, offset: Annotated[int, Query(ge=0)] = 0):
         job = job_or_404(account, job_id)
@@ -226,7 +353,7 @@ def create_app(
     @app.get("/api/conversations/{conversation_id}/jobs/{job_id}/logs/{stream}", response_class=FileResponse)
     async def download_log(conversation_id: str, job_id: str, stream: LogStream, account: SignedIn):
         conversation_or_404(account, conversation_id)
-        return log_download(app.state.tools.find_job(conversation_id, job_id), stream)
+        return log_download(find_job(app.state.store, conversation_id, job_id), stream)
 
     def log_download(job: dict | None, stream: LogStream) -> FileResponse:
         if not job or job["state"] not in TERMINAL:
@@ -239,7 +366,7 @@ def create_app(
     @app.post("/api/conversations/{conversation_id}/jobs/{job_id}/retry-summary", status_code=202)
     async def retry_summary(conversation_id: str, job_id: str, account: SignedIn):
         conversation_or_404(account, conversation_id)
-        job = app.state.tools.find_job(conversation_id, job_id)
+        job = find_job(app.state.store, conversation_id, job_id)
         if not job:
             raise HTTPException(404, "任务不存在。")
         if not app.state.settings.api_key:
@@ -248,12 +375,12 @@ def create_app(
         if not pending:
             raise HTTPException(409, "只有解释异常的任务可以重试解释。")
         app.state.events.send(account.id, "job.updated", pending)
-        app.state.agent.complete(pending, app.state.tools)
+        app.state.agent.complete(pending)
         return pending
 
     @app.get("/api/tools")
     async def tool_catalog(account: SignedIn):
-        return [tool["function"] for tool in tool_schemas()]
+        return [tool["function"] for tool in app.state.tools.model_schemas()]
 
     dist = frontend_dir or ROOT / "frontend" / "dist"
     if (dist / "assets").is_dir():

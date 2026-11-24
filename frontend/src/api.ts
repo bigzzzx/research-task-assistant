@@ -1,5 +1,7 @@
 export type JobState = 'queued' | 'running' | 'succeeded' | 'failed';
 export type Analysis = 'seq_stats' | 'find_orf';
+export type FailureCategory = 'input' | 'configuration' | 'temporary_resource' | 'resource_limit'
+  | 'timeout' | 'interrupted' | 'unknown';
 
 export interface Account {
   id: string;
@@ -48,7 +50,60 @@ export interface Job {
   exit_code: number | null;
   runner_error: string | null;
   created_at: string;
+  status_at: string;
+  duration_seconds: number | null;
+  queue_wait_seconds: number;
+  failure_category: FailureCategory | null;
+  failure_code: string | null;
+  failure_stage: 'input' | 'preparation' | 'launch' | 'execution' | null;
+  input_request_id: string | null;
+  retry_of_job_id: string | null;
+  root_job_id: string | null;
+  next_attempt_id: string | null;
+  attempt_number: number;
+  retry_kind: 'manual' | 'automatic' | null;
+  available_at: string | null;
   revision: number;
+}
+
+export interface InputRequest {
+  id: string;
+  conversation_id: string;
+  filename: string;
+  analysis_type: Analysis;
+  failed_job_id: string | null;
+  original_file_id: string | null;
+  failure_code: string | null;
+  resolved_job_id: string | null;
+  revision: number;
+}
+
+export interface RepairPreview {
+  token: string;
+  line: number;
+  before: string;
+  after: string;
+}
+
+export interface SourceExcerpt {
+  start_column: number;
+  text: string;
+  has_more: boolean;
+}
+
+export interface InputIssue {
+  code: string;
+  message: string;
+  line?: number;
+  columns?: [number, number][];
+  columns_truncated?: boolean;
+  excerpts: SourceExcerpt[];
+}
+
+export interface InputDiagnostics {
+  issues: InputIssue[];
+  truncated: boolean;
+  repair: RepairPreview | null;
 }
 
 export interface LocalFile {
@@ -82,6 +137,7 @@ export interface Config {
 export interface Room {
   messages: Message[];
   jobs: Job[];
+  input_requests: InputRequest[];
 }
 
 export interface Snapshot extends Room {

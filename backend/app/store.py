@@ -8,11 +8,40 @@ from uuid import uuid4
 
 from .config import SAMPLES
 from .context import HistoryTurn
+from .failures import Failure
 
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
+
+JOB_TABLE = """
+CREATE TABLE IF NOT EXISTS {table} (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    origin_message_id INTEGER NOT NULL REFERENCES messages(id),
+    file_id TEXT NOT NULL REFERENCES files(id),
+    analysis_type TEXT NOT NULL CHECK(analysis_type IN ('seq_stats', 'find_orf')),
+    state TEXT NOT NULL DEFAULT 'queued',
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    exit_code INTEGER,
+    runner_error TEXT,
+    summary_state TEXT NOT NULL DEFAULT 'pending',
+    revision INTEGER NOT NULL DEFAULT 0,
+    input_name TEXT,
+    failure_category TEXT,
+    failure_code TEXT,
+    failure_stage TEXT,
+    retry_of_job_id TEXT REFERENCES {table}(id),
+    root_job_id TEXT REFERENCES {table}(id),
+    attempt_number INTEGER NOT NULL DEFAULT 1,
+    retry_kind TEXT CHECK(retry_kind IN ('manual', 'automatic')),
+    automatic_retries INTEGER NOT NULL DEFAULT 0,
+    available_at TEXT
+);
+"""
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -24,6 +53,11 @@ CREATE TABLE IF NOT EXISTS users (
     username_key TEXT NOT NULL UNIQUE,
     password_hash TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS account_output_preferences (
+    owner_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    result_order TEXT CHECK(result_order IN ('file', 'sequence_id')),
+    gc_decimal_places INTEGER CHECK(gc_decimal_places BETWEEN 0 AND 2)
 );
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
@@ -77,31 +111,42 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS jobs (
+""" + JOB_TABLE.format(table="jobs")
+
+INPUT_REQUEST_TABLE = """
+CREATE TABLE IF NOT EXISTS input_requests (
     id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES conversations(id),
     origin_message_id INTEGER NOT NULL REFERENCES messages(id),
-    file_id TEXT NOT NULL REFERENCES files(id),
     analysis_type TEXT NOT NULL CHECK(analysis_type IN ('seq_stats', 'find_orf')),
-    state TEXT NOT NULL DEFAULT 'queued',
+    filename TEXT NOT NULL,
+    failed_job_id TEXT UNIQUE REFERENCES jobs(id),
+    resolved_job_id TEXT REFERENCES jobs(id),
     created_at TEXT NOT NULL,
-    started_at TEXT,
-    finished_at TEXT,
-    exit_code INTEGER,
-    runner_error TEXT,
-    summary_state TEXT NOT NULL DEFAULT 'pending',
-    revision INTEGER NOT NULL DEFAULT 0,
-    input_name TEXT,
-    UNIQUE(origin_message_id, file_id, analysis_type)
-);
-CREATE INDEX IF NOT EXISTS jobs_conversation ON jobs(conversation_id, created_at);
+    revision INTEGER NOT NULL DEFAULT 0
+)
 """
 
 JOB_SELECT = """
-SELECT j.*, COALESCE(j.input_name, f.display_name) AS filename, c.owner_id
+SELECT j.*, COALESCE(j.input_name, f.display_name) AS filename, c.owner_id,
+       request.id AS input_request_id, next.id AS next_attempt_id, next.available_at AS next_attempt_at,
+       COALESCE(j.finished_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) AS status_at,
+       MAX(0, ROUND((julianday(COALESCE(j.started_at, j.finished_at, 'now')) - julianday(j.created_at)) * 86400, 3))
+           AS queue_wait_seconds,
+       MAX(0, ROUND((julianday(COALESCE(j.finished_at, 'now')) - julianday(j.started_at)) * 86400, 3))
+           AS duration_seconds
 FROM jobs j
 JOIN files f ON f.id = j.file_id
 JOIN conversations c ON c.id = j.conversation_id
+LEFT JOIN input_requests request ON request.failed_job_id = j.id
+LEFT JOIN jobs next ON next.retry_of_job_id = j.id
+"""
+
+INPUT_REQUEST_SELECT = """
+SELECT request.*, failed.file_id AS original_file_id, failed.failure_code
+FROM input_requests request
+JOIN conversations c ON c.id = request.conversation_id
+LEFT JOIN jobs failed ON failed.id = request.failed_job_id
 """
 
 
@@ -135,6 +180,7 @@ class Store:
                 columns = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+            self._upgrade_jobs()
             self.db.execute("CREATE INDEX IF NOT EXISTS conversations_owner ON conversations(owner_id, updated_at)")
             self.db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS files_owner_name ON files(owner_id, name_key) WHERE owner_id IS NOT NULL"
@@ -143,6 +189,28 @@ class Store:
                 UPDATE jobs SET input_name=(SELECT display_name FROM files WHERE id=jobs.file_id)
                 WHERE input_name IS NULL
             """)
+
+    def _upgrade_jobs(self) -> None:
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}
+        if "retry_of_job_id" not in columns:
+            old_fields = ("id, conversation_id, origin_message_id, file_id, analysis_type, state, created_at, "
+                          "started_at, finished_at, exit_code, runner_error, summary_state, revision, input_name")
+            self.db.execute(JOB_TABLE.format(table="jobs_upgrade"))
+            self.db.execute(f"INSERT INTO jobs_upgrade ({old_fields}) SELECT {old_fields} FROM jobs")
+            self.db.execute("DROP TABLE jobs")
+            self.db.execute("ALTER TABLE jobs_upgrade RENAME TO jobs")
+        self.db.execute("CREATE INDEX IF NOT EXISTS jobs_conversation ON jobs(conversation_id, created_at)")
+        self.db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS jobs_initial_submission ON jobs(origin_message_id, file_id, analysis_type)
+            WHERE retry_of_job_id IS NULL
+        """)
+        self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS job_next_attempt ON jobs(retry_of_job_id)")
+        self.db.execute(INPUT_REQUEST_TABLE)
+        self.db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS input_request_missing_name
+            ON input_requests(origin_message_id, analysis_type, filename) WHERE failed_job_id IS NULL
+        """)
+        self.db.execute("CREATE INDEX IF NOT EXISTS input_requests_conversation ON input_requests(conversation_id)")
 
     def _one(self, sql: str, params: tuple = ()) -> dict | None:
         row = self.db.execute(sql, params).fetchone()
@@ -162,6 +230,27 @@ class Store:
 
     def user_by_name(self, key: str) -> dict | None:
         return self._one("SELECT * FROM users WHERE username_key=?", (key,))
+
+    def output_preferences(self, owner_id: str) -> dict:
+        return self._one(
+            "SELECT result_order, gc_decimal_places FROM account_output_preferences WHERE owner_id=?",
+            (owner_id,),
+        ) or {"result_order": None, "gc_decimal_places": None}
+
+    def save_output_preferences(
+        self, owner_id: str, order: str | None, decimals: int | None, *, keep_unspecified: bool = False,
+    ) -> dict:
+        with self.db:
+            self.db.execute(
+                """INSERT INTO account_output_preferences (owner_id, result_order, gc_decimal_places)
+                   VALUES (?, ?, ?) ON CONFLICT(owner_id) DO UPDATE
+                   SET result_order=CASE WHEN ? THEN COALESCE(excluded.result_order, result_order)
+                                         ELSE excluded.result_order END,
+                       gc_decimal_places=CASE WHEN ? THEN COALESCE(excluded.gc_decimal_places, gc_decimal_places)
+                                              ELSE excluded.gc_decimal_places END""",
+                (owner_id, order, decimals, keep_unspecified, keep_unspecified),
+            )
+        return self.output_preferences(owner_id)
 
     def create_session(self, user_id: str, token_hash: str, expires_at: int) -> None:
         with self.db:
@@ -225,13 +314,16 @@ class Store:
 
     def add_file(self, owner_id: str, file_id: str, name: str, size: int, conversation_id: str | None = None) -> dict:
         with self.db:
-            self.db.execute(
-                """INSERT INTO files
-                   (id, conversation_id, display_name, name_key, storage_name, source, size_bytes, owner_id, created_at)
-                   VALUES (?, ?, ?, ?, ?, 'upload', ?, ?, ?)""",
-                (file_id, conversation_id, name, name.casefold(), file_id, size, owner_id, now()),
-            )
+            self._insert_file(owner_id, file_id, name, size, conversation_id)
         return self.file(file_id)
+
+    def _insert_file(self, owner_id: str, file_id: str, name: str, size: int, conversation_id: str | None) -> None:
+        self.db.execute(
+            """INSERT INTO files
+               (id, conversation_id, display_name, name_key, storage_name, source, size_bytes, owner_id, created_at)
+               VALUES (?, ?, ?, ?, ?, 'upload', ?, ?, ?)""",
+            (file_id, conversation_id, name, name.casefold(), file_id, size, owner_id, now()),
+        )
 
     @staticmethod
     def public_file(row: dict) -> dict:
@@ -378,6 +470,8 @@ class Store:
             )],
             "jobs": self._all(JOB_SELECT + " WHERE j.conversation_id=? ORDER BY j.created_at DESC", (conversation_id,)),
             "files": [self.public_file(row) for row in self.files(owner_id)],
+            "input_requests": self._all(INPUT_REQUEST_SELECT + " WHERE request.conversation_id=? ORDER BY request.created_at",
+                                        (conversation_id,)),
         }
 
     def recent_jobs(self, conversation_id: str, before_user_id: int) -> list[dict]:
@@ -417,39 +511,125 @@ class Store:
         )
 
     def submit(self, conversation_id: str, turn_id: int, file_id: str, analysis_type: str) -> tuple[dict, bool]:
-        job_id = uuid4().hex
         with self.db:
-            cursor = self.db.execute(
-                """INSERT INTO jobs (id, conversation_id, origin_message_id, file_id, analysis_type, created_at, input_name)
-                   VALUES (?, ?, ?, ?, ?, ?, (SELECT display_name FROM files WHERE id=?))
-                   ON CONFLICT(origin_message_id, file_id, analysis_type) DO NOTHING""",
-                (job_id, conversation_id, turn_id, file_id, analysis_type, now(), file_id),
-            )
-            if not cursor.rowcount:
-                row = self._one(
-                    JOB_SELECT + " WHERE j.origin_message_id=? AND j.file_id=? AND j.analysis_type=?",
-                    (turn_id, file_id, analysis_type),
-                )
-                return row, False
+            return self._submit(conversation_id, turn_id, file_id, analysis_type)
+
+    def _submit(self, conversation_id: str, turn_id: int, file_id: str, analysis_type: str) -> tuple[dict, bool]:
+        job_id = uuid4().hex
+        cursor = self.db.execute(
+            """INSERT INTO jobs (id, conversation_id, origin_message_id, file_id, analysis_type, created_at, input_name)
+               VALUES (?, ?, ?, ?, ?, ?, (SELECT display_name FROM files WHERE id=?))
+               ON CONFLICT(origin_message_id, file_id, analysis_type) WHERE retry_of_job_id IS NULL DO NOTHING""",
+            (job_id, conversation_id, turn_id, file_id, analysis_type, now(), file_id),
+        )
+        if cursor.rowcount:
+            return self.job(job_id), True
+        row = self._one(JOB_SELECT + """
+            WHERE j.origin_message_id=? AND j.file_id=? AND j.analysis_type=? AND j.retry_of_job_id IS NULL
+        """, (turn_id, file_id, analysis_type))
+        return row, False
+
+    def retry_job(self, job: dict) -> tuple[dict, bool]:
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            return self._retry(job, job["file_id"])
+
+    def _retry(self, job: dict, file_id: str, retry_at: str | None = None) -> tuple[dict, bool]:
+        existing = self._one(JOB_SELECT + " WHERE j.retry_of_job_id=?", (job["id"],))
+        if existing:
+            return existing, False
+        job_id = uuid4().hex
+        self.db.execute(
+            """INSERT INTO jobs (id, conversation_id, origin_message_id, file_id, analysis_type, created_at, input_name,
+                                 retry_of_job_id, root_job_id, attempt_number, retry_kind, automatic_retries, available_at)
+               VALUES (?, ?, ?, ?, ?, ?, (SELECT display_name FROM files WHERE id=?), ?, ?, ?, ?, ?, ?)""",
+            (job_id, job["conversation_id"], job["origin_message_id"], file_id, job["analysis_type"], now(), file_id,
+             job["id"], job["root_job_id"] or job["id"], job["attempt_number"] + 1,
+             "automatic" if retry_at else "manual", job["automatic_retries"] + 1 if retry_at else 0, retry_at),
+        )
+        self.db.execute("UPDATE jobs SET revision=revision+1 WHERE id=?", (job["id"],))
         return self.job(job_id), True
 
+    def queued_jobs(self) -> list[dict]:
+        return self._all(JOB_SELECT + " WHERE j.state='queued' AND c.owner_id IS NOT NULL ORDER BY j.created_at")
+
+    def request_input(self, conversation_id: str, turn_id: int, analysis_type: str, filename: str) -> tuple[dict, bool]:
+        with self.db:
+            return self._request_input(conversation_id, turn_id, analysis_type, filename)
+
+    def _request_input(
+        self, conversation_id: str, turn_id: int, analysis_type: str, filename: str, failed_job_id: str | None = None,
+    ) -> tuple[dict, bool]:
+        request_id = uuid4().hex
+        cursor = self.db.execute("""
+            INSERT INTO input_requests (id, conversation_id, origin_message_id, analysis_type, filename, failed_job_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
+        """, (request_id, conversation_id, turn_id, analysis_type, filename, failed_job_id, now()))
+        if cursor.rowcount:
+            return self.input_request(request_id), True
+        row = self._one(INPUT_REQUEST_SELECT + """
+            WHERE request.origin_message_id=? AND request.analysis_type=? AND request.filename=? AND request.failed_job_id IS ?
+        """, (turn_id, analysis_type, filename, failed_job_id))
+        return row, False
+
+    def input_request(self, request_id: str) -> dict | None:
+        return self._one(INPUT_REQUEST_SELECT + " WHERE request.id=?", (request_id,))
+
+    def owned_input_request(self, owner_id: str, request_id: str) -> dict | None:
+        return self._one(INPUT_REQUEST_SELECT + " WHERE c.owner_id=? AND request.id=?", (owner_id, request_id))
+
+    def resolve_input(
+        self, owner_id: str, request_id: str, file_id: str, *, repaired_file: tuple[str, int] | None = None,
+    ) -> tuple[dict, dict, bool]:
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            request = self.owned_input_request(owner_id, request_id)
+            if request["resolved_job_id"]:
+                return request, self.job(request["resolved_job_id"]), False
+            if repaired_file:
+                name, size = repaired_file
+                self._insert_file(owner_id, file_id, name, size, request["conversation_id"])
+            if request["failed_job_id"]:
+                job, created = self._retry(self.job(request["failed_job_id"]), file_id)
+            else:
+                job, created = self._submit(request["conversation_id"], request["origin_message_id"],
+                                            file_id, request["analysis_type"])
+            self.db.execute("UPDATE input_requests SET resolved_job_id=?, revision=revision+1 WHERE id=?",
+                            (job["id"], request_id))
+            return self.input_request(request_id), job, created
+
     def claim_job(self, job_id: str) -> dict | None:
+        timestamp = now()
         with self.db:
             cursor = self.db.execute(
                 """UPDATE jobs SET state='running', started_at=?, revision=revision+1
-                   WHERE id=? AND state='queued'""",
-                (now(), job_id),
+                   WHERE id=? AND state='queued' AND (available_at IS NULL OR available_at<=?)""",
+                (timestamp, job_id, timestamp),
             )
         return self.job(job_id) if cursor.rowcount else None
 
-    def finish_job(self, job_id: str, exit_code: int | None, runner_error: str | None = None) -> dict:
-        state = "succeeded" if exit_code == 0 and not runner_error else "failed"
+    def finish_job(
+        self, job_id: str, exit_code: int | None, runner_error: str | None = None, *, failure: Failure | None = None,
+        retry_at: str | None = None,
+    ) -> dict:
+        if failure:
+            runner_error = failure.detail
+        state = "succeeded" if exit_code == 0 and not (failure or runner_error) else "failed"
         with self.db:
-            self.db.execute(
-                """UPDATE jobs SET state=?, finished_at=?, exit_code=?, runner_error=?, revision=revision+1
+            changed = self.db.execute(
+                """UPDATE jobs SET state=?, finished_at=?, exit_code=?, runner_error=?, failure_category=?,
+                                   failure_code=?, failure_stage=?, revision=revision+1
                    WHERE id=? AND state IN ('queued', 'running')""",
-                (state, now(), exit_code, runner_error, job_id),
+                (state, now(), exit_code, runner_error, failure.category if failure else None,
+                 failure.code if failure else None, failure.stage if failure else None, job_id),
             )
+            if changed.rowcount and (retry_at or (failure and failure.category == "input")):
+                job = self.job(job_id)
+                if retry_at:
+                    self._retry(job, job["file_id"], retry_at)
+                else:
+                    self._request_input(job["conversation_id"], job["origin_message_id"], job["analysis_type"],
+                                        job["filename"], job_id)
         return self.job(job_id)
 
     def change_summary(self, job_id: str, before: str, after: str) -> dict | None:
@@ -470,8 +650,9 @@ class Store:
     def recover(self) -> list[dict]:
         with self.db:
             self.db.execute(
-                """UPDATE jobs SET state='failed', finished_at=?, runner_error=?, revision=revision+1
-                   WHERE state IN ('queued', 'running')""",
+                """UPDATE jobs SET state='failed', finished_at=?, runner_error=?, failure_category='interrupted',
+                                   failure_code='INTERRUPTED', failure_stage='execution', revision=revision+1
+                   WHERE state='running'""",
                 (now(), "后端重启时任务尚未确认完成，请重新提交计算。"),
             )
             self.db.execute(

@@ -1,9 +1,11 @@
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from backend.app.config import LOG_LIMIT, ROOT
 from backend.app.jobs import LOG_PAGE_BYTES, bounded_log, log_page
+from backend.app.tools import format_gc_log
 from scripts.fasta import InvalidFasta, Record, read_fasta
 from scripts.find_orf import find_orf
 from scripts.seq_stats import seq_stats
@@ -35,6 +37,8 @@ class AnalysisTests(TestCase):
             read_fasta(ROOT / "data" / "sample3.fasta")
         issues = failure.exception.diagnostics
         self.assertEqual([(item.code, item.line) for item in issues], [("MISSING_HEADER", 1), ("INVALID_BASE", 2)])
+        self.assertEqual(issues[0].columns, [(1, 1)])
+        self.assertEqual(issues[1].columns, [(7, 9), (16, 18)])
         self.assertEqual(issues[1].characters, ["X", "1", "2", "3"])
 
     def test_bom_multiline_and_ambiguous_bases(self):
@@ -43,8 +47,26 @@ class AnalysisTests(TestCase):
             path.write_bytes("\ufeff>id description\r\nac\r\n\r\ngn\r\n".encode())
             records = read_fasta(path)
             self.assertEqual(records, [Record("id", "ACGN")])
-            self.assertEqual(seq_stats(records[0]), {"id": "id", "length_nt": 4, "gc_pct": 66.67})
+            self.assertEqual(seq_stats(records[0]), {
+                "id": "id", "length_nt": 4, "gc_pct": 66.67, "gc_count": 2, "known_bases": 3,
+            })
             self.assertIsNone(seq_stats(Record("id", "NNN"))["gc_pct"])
+
+    def test_gc_preview_rounds_counts_once_and_preserves_historical_logs(self):
+        raw = seq_stats(Record("example", "G" * 15 + "A" * 4))
+        self.assertEqual(raw["gc_pct"], 78.95)
+        self.assertEqual((raw["gc_count"], raw["known_bases"]), (15, 19))
+        for places, expected in [(0, "79%"), (1, "78.9%"), (2, "78.95%")]:
+            stdout = json.dumps(raw) + "\n"
+            with self.subTest(places=places):
+                result = format_gc_log({"stdout": stdout}, places)
+                self.assertEqual(result["stdout"], stdout)
+                self.assertEqual(json.loads(result["display_stdout"])["gc_display"], expected)
+
+        old = {"stdout": json.dumps({"id": "example", "length_nt": 19, "gc_pct": 78.95})}
+        result = format_gc_log(old, 1)
+        self.assertEqual(json.loads(result["display_stdout"])["gc_display"], "78.95%")
+        self.assertIn("gc_precision_note", result)
 
     def test_empty_encoding_and_format(self):
         cases = [

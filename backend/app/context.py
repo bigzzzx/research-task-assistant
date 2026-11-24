@@ -55,6 +55,8 @@ def clip_text(text: str, limit: int, marker: str = "\n[…]\n") -> str:
 
 def tool_observation(result: dict, log_limit: int = 5000) -> str:
     payload = result.copy()
+    if "display_stdout" in payload:
+        payload["stdout"] = payload.pop("display_stdout")
     for stream in ("stdout", "stderr"):
         text = payload.get(stream)
         if isinstance(text, str) and len(text.encode("utf-8")) > log_limit:

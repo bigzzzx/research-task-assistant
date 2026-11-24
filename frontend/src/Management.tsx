@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { ClipboardList, FileText, Plus, Terminal, X } from 'lucide-react';
-import { accountUrl, type Job, type JobLog, type JobState, type LocalFile, request, type ToolDefinition } from './api';
+import { accountUrl, type FailureCategory, type Job, type JobLog, type JobState, type LocalFile, request, type ToolDefinition } from './api';
 import { ANALYSIS, STATES, Status, showSize } from './display';
 import { errorText } from './useWorkspace';
 
@@ -13,12 +13,19 @@ function date(value: string | null) {
   return value ? <time dateTime={value}>{timestamp.format(new Date(value))}</time> : '—';
 }
 
-function duration(job: Job, clock: number) {
-  if (!job.started_at) return '—';
-  const finished = job.finished_at ? Date.parse(job.finished_at) : clock;
-  const seconds = Math.max(0, finished - Date.parse(job.started_at)) / 1000;
+function duration(seconds: number | null) {
+  if (seconds === null) return '—';
   if (seconds < 60) return seconds.toFixed(1) + ' 秒';
   return Math.floor(seconds / 60) + ' 分 ' + (Math.floor(seconds) % 60) + ' 秒';
+}
+
+function sinceStatus(job: Job, clock: number) {
+  return Math.max(0, clock - Date.parse(job.status_at)) / 1000;
+}
+
+function runDuration(job: Job, clock: number) {
+  if (job.duration_seconds === null) return '—';
+  return duration(job.duration_seconds + (job.state === 'running' ? sinceStatus(job, clock) : 0));
 }
 
 function FileList({ files, onAnalyze }: { files: LocalFile[]; onAnalyze: (file: LocalFile) => void }) {
@@ -144,16 +151,42 @@ function LogPanel({ job, stream }: { job: Job; stream: Stream }) {
   );
 }
 
-function TaskDetail({ job, clock, onClose, onConversation }: {
+const FAILURE_LABELS: Record<FailureCategory, string> = {
+  input: '输入文件问题',
+  configuration: '运行配置问题',
+  temporary_resource: '临时资源故障',
+  resource_limit: '资源不足',
+  timeout: '执行超时',
+  interrupted: '执行中断',
+  unknown: '原因待确认',
+};
+const FAILURE_STAGES = { input: '读取输入', preparation: '准备任务', launch: '启动进程', execution: '执行脚本' };
+
+function TaskDetail({ job, clock, attempts, onSelect, onRetry, onClose, onConversation }: {
   job: Job; clock: number; onClose: () => void; onConversation: (id: string) => void;
+  attempts: Job[]; onSelect: (id: string) => void; onRetry: (job: Job) => Promise<Job>;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [stream, setStream] = useState<Stream>(job.state === 'failed' ? 'stderr' : 'stdout');
+  const [retrying, setRetrying] = useState(false);
+  const [error, setError] = useState('');
   useEffect(() => {
     const element = dialog.current;
     element?.showModal();
     return () => element?.close();
   }, []);
+
+  async function retry() {
+    setRetrying(true);
+    setError('');
+    try {
+      onSelect((await onRetry(job)).id);
+    } catch (failure) {
+      setError(errorText(failure));
+    } finally {
+      setRetrying(false);
+    }
+  }
 
   return (
     <dialog className="task-detail" aria-labelledby="task-detail-title" ref={dialog}
@@ -170,18 +203,47 @@ function TaskDetail({ job, clock, onClose, onConversation }: {
           <div><dt>任务类型</dt><dd>{ANALYSIS[job.analysis_type]}</dd></div>
           <div><dt>文件名称</dt><dd><code>{job.filename}</code></dd></div>
           <div><dt>提交时间</dt><dd>{date(job.created_at)}</dd></div>
-          <div><dt>执行时长</dt><dd>{duration(job, clock)}</dd></div>
+          <div><dt>执行时长</dt><dd>{runDuration(job, clock)}</dd></div>
+          <div><dt>排队等待</dt><dd>
+            {duration(job.queue_wait_seconds + (job.state === 'queued' ? sinceStatus(job, clock) : 0))}
+          </dd></div>
           <div><dt>开始时间</dt><dd>{date(job.started_at)}</dd></div>
           <div><dt>完成时间</dt><dd>{date(job.finished_at)}</dd></div>
           <div><dt>退出码</dt><dd>{job.exit_code ?? '—'}</dd></div>
+          {job.state === 'queued' && job.available_at &&
+            <div><dt>计划重试时间</dt><dd>{date(job.available_at)}</dd></div>}
+          {job.state === 'failed' && <>
+            <div><dt>失败原因</dt><dd>{FAILURE_LABELS[job.failure_category ?? 'unknown']}</dd></div>
+            {job.failure_stage && <div><dt>失败阶段</dt><dd>{FAILURE_STAGES[job.failure_stage]}</dd></div>}
+            {job.failure_code && <div><dt>错误码</dt><dd><code>{job.failure_code}</code></dd></div>}
+          </>}
         </dl>
         {job.runner_error && <p className="job-reason">{job.runner_error}</p>}
+        {attempts.length > 1 && <section className="task-attempts" aria-label="尝试记录">
+          <h3>尝试记录</h3>
+          {attempts.map(attempt => (
+            <button type="button" className="secondary-button" key={attempt.id}
+              aria-pressed={attempt.id === job.id} onClick={() => onSelect(attempt.id)}>
+              第 {attempt.attempt_number} 次
+              {attempt.retry_kind === 'automatic' && ' · 自动重试'}
+              {attempt.retry_kind === 'manual' && ' · 手动重跑'}
+              <code title={attempt.id}>{attempt.id.slice(0, 8)}</code>
+              <Status state={attempt.state} />
+            </button>
+          ))}
+        </section>}
         <div className="log-tabs" aria-label="日志类型">
           <button type="button" aria-pressed={stream === 'stdout'} onClick={() => setStream('stdout')}>标准输出</button>
           <button type="button" aria-pressed={stream === 'stderr'} onClick={() => setStream('stderr')}>错误日志</button>
         </div>
         <LogPanel key={stream} job={job} stream={stream} />
+        {error && <p className="tone-error" role="alert">{error}</p>}
         <footer className="detail-footer">
+          {job.state === 'failed' && !job.next_attempt_id && (job.input_request_id
+            ? <button className="primary-button" onClick={() => onConversation(job.conversation_id)}>补充文件并继续</button>
+            : <button className="primary-button" disabled={retrying} onClick={() => void retry()}>
+              {retrying ? '正在提交' : '重新运行'}
+            </button>)}
           <button className="secondary-button" onClick={() => onConversation(job.conversation_id)}>打开原会话</button>
         </footer>
       </div>
@@ -197,19 +259,21 @@ const FILTERS: Array<{ state: 'all' | JobState; label: string }> = [
   { state: 'failed', label: STATES.failed },
 ];
 
-export function TaskManager({ jobs, onConversation }: { jobs: Job[]; onConversation: (id: string) => void }) {
+export function TaskManager({ jobs, onConversation, onRetry }: {
+  jobs: Job[]; onConversation: (id: string) => void; onRetry: (job: Job) => Promise<Job>;
+}) {
   const [filter, setFilter] = useState<'all' | JobState>('all');
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<string>();
   const [clock, setClock] = useState(Date.now);
-  const running = jobs.some(job => job.state === 'running');
+  const active = jobs.some(job => job.state === 'running' || job.state === 'queued');
   useEffect(() => {
-    if (!running) return;
+    if (!active) return;
     const tick = () => setClock(Date.now());
     tick();
     const timer = window.setInterval(tick, 1000);
     return () => window.clearInterval(timer);
-  }, [running]);
+  }, [active]);
 
   const query = search.trim().toLowerCase();
   const results = jobs.filter(job =>
@@ -217,6 +281,8 @@ export function TaskManager({ jobs, onConversation }: { jobs: Job[]; onConversat
     (job.id.includes(query) || job.filename.toLowerCase().includes(query)),
   ).sort((a, b) => b.created_at.localeCompare(a.created_at));
   const detail = jobs.find(job => job.id === selected);
+  const attempts = detail ? jobs.filter(job =>
+    (job.root_job_id ?? job.id) === (detail.root_job_id ?? detail.id)).sort((a, b) => a.attempt_number - b.attempt_number) : [];
 
   return (
     <div className="management-content">
@@ -247,7 +313,7 @@ export function TaskManager({ jobs, onConversation }: { jobs: Job[]; onConversat
                 <td className="task-file-cell" title={job.filename}>{job.filename}</td>
                 <td><Status state={job.state} /></td>
                 <td className="task-time-cell">{date(job.created_at)}</td>
-                <td>{duration(job, clock)}</td>
+                <td>{runDuration(job, clock)}</td>
                 <td><button className="text-button" onClick={() => setSelected(job.id)}>查看日志</button></td>
               </tr>
             ))}</tbody>
@@ -258,8 +324,8 @@ export function TaskManager({ jobs, onConversation }: { jobs: Job[]; onConversat
           <ClipboardList aria-hidden="true" /><p>{jobs.length ? '没有符合条件的任务' : '还没有提交任务'}</p>
         </div>
       )}
-      {detail && <TaskDetail job={detail} clock={clock} onClose={() => setSelected(undefined)}
-        onConversation={onConversation} />}
+      {detail && <TaskDetail key={detail.id} job={detail} clock={clock} onClose={() => setSelected(undefined)}
+        attempts={attempts} onSelect={setSelected} onRetry={onRetry} onConversation={onConversation} />}
     </div>
   );
 }

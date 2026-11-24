@@ -144,8 +144,8 @@ class ModelFixture:
         for record in records:
             if "record_count" in record:
                 continue
-            if "gc_pct" in record:
-                gc = "无法计算" if record["gc_pct"] is None else f"{record['gc_pct']:.2f}%"
+            if "gc_display" in record:
+                gc = record["gc_display"] or "无法计算"
                 result_lines.append(f"{record['id']} 为 {record['length_nt']} nt，GC 含量 {gc}。")
             elif record["orf"]:
                 orf = record["orf"]

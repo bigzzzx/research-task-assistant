@@ -21,6 +21,8 @@ class Settings:
     job_timeout: float = 60
     job_workers: int = 2
     input_token_budget: int = DEFAULT_INPUT_TOKEN_BUDGET
+    job_max_auto_retries: int = 2
+    job_retry_delay: float = 3
 
     @classmethod
     def load(cls) -> "Settings":

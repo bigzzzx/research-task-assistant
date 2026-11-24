@@ -1,8 +1,11 @@
 """The three callable tools and their validation boundary."""
 
+from collections.abc import Collection
 import json
 from pathlib import PurePath
 import re
+
+from scripts.seq_stats import gc_percentage
 
 from .config import ANALYSES
 from .jobs import Jobs, status_view
@@ -19,35 +22,64 @@ DEFINITIONS = {
                 "enum": list(ANALYSES),
                 "description": "seq_stats 为长度和 GC 统计，find_orf 为正链最长完整 ORF。",
             },
-            "filename": {"type": "string", "description": "已登记的 FASTA 文件名，如 sample1.fasta。"},
+            "filename": {"type": "string", "description": "用户指定的 FASTA 文件名，如 sample1.fasta。缺失时可提示补传。"},
         },
     ),
-    "job_status": ("按任务 ID 查询当前会话任务的实际状态和退出码。", JOB_PARAM),
+    "job_status": ("按任务 ID 查询当前会话任务的状态、时间、退出码与恢复信息。", JOB_PARAM),
     "read_log": ("读取指定任务的标准输出和错误日志。两路日志含各自的截断标记。", JOB_PARAM),
 }
 
 
-def tool_schemas(names=tuple(DEFINITIONS)) -> list[dict]:
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": DEFINITIONS[name][0],
-                "parameters": {
-                    "type": "object",
-                    "properties": DEFINITIONS[name][1],
-                    "required": list(DEFINITIONS[name][1]),
-                    "additionalProperties": False,
-                },
-            },
-        }
-        for name in names
-    ]
-
-
 def tool_error(code: str, message: str) -> dict:
     return {"ok": False, "error": {"code": code, "message": message}}
+
+
+def argument_error(arguments: dict, expected: Collection[str]) -> dict | None:
+    if (arguments.keys() != set(expected)
+            or any(not isinstance(value, str) or not value or len(value) > 256 for value in arguments.values())):
+        return tool_error("INVALID_ARGUMENTS", f"请提供有效的字段：{', '.join(expected)}。")
+    return None
+
+
+def find_job(store: Store, conversation_id: str, job_id: str) -> dict | None:
+    if not JOB_ID.fullmatch(job_id):
+        return None
+    if len(job_id) == 32:
+        job = store.job(job_id.lower())
+        return job if job and job["conversation_id"] == conversation_id else None
+    matches = store.jobs_with_prefix(conversation_id, job_id.lower())
+    return matches[0] if len(matches) == 1 else None
+
+
+def format_gc_log(log: dict, decimal_places: int) -> dict:
+    """Add a display preview and keep the original log available for inspection."""
+    lines = []
+    legacy_precision = False
+    for line in log["stdout"].splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            lines.append(line)
+            continue
+        if not isinstance(row, dict) or "gc_pct" not in row:
+            lines.append(line)
+            continue
+
+        saved_percentage = row.pop("gc_pct")
+        gc_count, known_bases = row.get("gc_count"), row.get("known_bases")
+        if type(gc_count) is int and type(known_bases) is int and 0 <= gc_count <= known_bases:
+            percentage = gc_percentage(gc_count, known_bases, decimal_places)
+            row["gc_display"] = f"{percentage}%" if percentage is not None else None
+        elif isinstance(saved_percentage, (int, float)):
+            row["gc_display"] = f"{saved_percentage:.2f}%"
+            legacy_precision |= decimal_places != 2
+        else:
+            row["gc_display"] = None
+        lines.append(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+    result = {**log, "display_stdout": "\n".join(lines)}
+    if legacy_precision:
+        result["gc_precision_note"] = "这份历史日志只保存了两位小数，按记录中的精度显示。"
+    return result
 
 
 class Tools:
@@ -56,38 +88,24 @@ class Tools:
         self.jobs = jobs
 
     def execute(
-        self, owner_id: str, conversation_id: str, turn_id: int, name: str, raw: str, *, only_job: str | None = None,
+        self, owner_id: str, conversation_id: str, turn_id: int, name: str, arguments: dict,
+        *, only_job: str | None = None,
     ) -> dict:
         if not self.store.owned_conversation(owner_id, conversation_id):
             return tool_error("CONVERSATION_NOT_FOUND", "当前账号找不到此会话。")
         if name not in DEFINITIONS or (only_job and name == "submit_job"):
             return tool_error("UNKNOWN_TOOL", "这一轮无法使用这个工具。")
-        try:
-            arguments = json.loads(raw)
-        except (ValueError, RecursionError):
-            return tool_error("INVALID_ARGUMENTS", "工具参数不是有效的 JSON 对象。")
-        expected = DEFINITIONS[name][1]
-        if (not isinstance(arguments, dict) or arguments.keys() != expected.keys()
-                or any(not isinstance(value, str) or not value or len(value) > 256 for value in arguments.values())):
-            return tool_error("INVALID_ARGUMENTS", f"请提供有效的字段：{', '.join(expected)}。")
+        if error := argument_error(arguments, DEFINITIONS[name][1]):
+            return error
 
         if name == "submit_job":
             return self._submit(owner_id, conversation_id, turn_id, arguments["analysis_type"], arguments["filename"])
 
         job_id = arguments["job_id"]
-        job = self.find_job(conversation_id, job_id)
+        job = find_job(self.store, conversation_id, job_id)
         if not job or (only_job and job["id"] != only_job):
             return tool_error("JOB_NOT_FOUND", "当前会话找不到该任务。请从工具记录中复制任务 ID。")
         return status_view(job) if name == "job_status" else self.jobs.log_preview(job)
-
-    def find_job(self, conversation_id: str, job_id: str) -> dict | None:
-        if not JOB_ID.fullmatch(job_id):
-            return None
-        if len(job_id) == 32:
-            job = self.store.job(job_id.lower())
-            return job if job and job["conversation_id"] == conversation_id else None
-        matches = self.store.jobs_with_prefix(conversation_id, job_id.lower())
-        return matches[0] if len(matches) == 1 else None
 
     def _submit(self, owner_id: str, conversation_id: str, turn_id: int, analysis_type: str, filename: str) -> dict:
         if analysis_type not in ANALYSES:
@@ -101,7 +119,11 @@ class Tools:
         if not matches and not PurePath(key).suffix:
             matches = [item for item in files if PurePath(item["name_key"]).stem == key]
         if not matches:
-            return tool_error("FILE_NOT_FOUND", "未找到该文件。请确认样例名或通过上传入口添加文件。")
+            pending, created = self.store.request_input(conversation_id, turn_id, analysis_type, filename.strip())
+            if created:
+                self.jobs.events.send(owner_id, "input.updated", pending)
+            return {**tool_error("FILE_NOT_FOUND", "未找到该文件。请在待补充文件卡片选择或上传文件，再确认继续。"),
+                    "input_request_id": pending["id"]}
         if len(matches) > 1:
             return tool_error("AMBIGUOUS_FILE", "有多个同名文件，请选择带扩展名的完整文件名。")
 

@@ -1,4 +1,6 @@
 fastapi==0.165.0
 uvicorn==0.54.0
 httpx==0.28.1
+httpx2==2.16.2
+mcp==2.3.0
 python-dotenv==1.2.4

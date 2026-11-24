@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { type Config, type Conversation, type Job, type LocalFile, type Message,
+import { type Config, type Conversation, type InputRequest, type Job, type LocalFile, type Message,
   type Room, type Snapshot, accountUrl, request, roomPath, sendText, uploadFile } from './api';
 
-const EMPTY_ROOM: Room = { messages: [], jobs: [] };
+const EMPTY_ROOM: Room = { messages: [], jobs: [], input_requests: [] };
 
 interface MessageDelta {
   conversation_id: string;
@@ -46,7 +46,6 @@ export function useWorkspace(accountId: string) {
   const [rooms, setRooms] = useState<Record<string, Room>>({});
   const roomsRef = useRef<Record<string, Room>>({});
   const [seen, setSeen] = useState(() => readSeen(seenKey));
-  const [connection, setConnection] = useState<'connecting' | 'online' | 'retrying'>('connecting');
   const [notice, setNotice] = useState('');
   const [toast, setToast] = useState<{ conversationId: string; text: string }>();
   const listRequest = useRef(0);
@@ -74,6 +73,7 @@ export function useWorkspace(accountId: string) {
     mutateRoom(id, room => ({
       messages: mergeRows(room.messages, snapshot.messages).sort((a, b) => a.id - b.id),
       jobs: mergeRows(room.jobs, snapshot.jobs).sort((a, b) => b.created_at.localeCompare(a.created_at)),
+      input_requests: mergeRows(room.input_requests, snapshot.input_requests ?? []),
     }));
     setJobs(previous => mergeRows(previous, snapshot.jobs));
     setFiles(previous => mergeRows(previous, snapshot.files));
@@ -127,6 +127,12 @@ export function useWorkspace(accountId: string) {
     }));
   }, [mutateRoom]);
 
+  const recordInputRequest = useCallback((input: InputRequest) => {
+    mutateRoom(input.conversation_id, room => ({
+      ...room, input_requests: mergeRows(room.input_requests, [input]),
+    }));
+  }, [mutateRoom]);
+
   useEffect(() => {
     let alive = true;
     const source = new EventSource(accountUrl('/api/events'));
@@ -155,7 +161,6 @@ export function useWorkspace(accountId: string) {
     };
 
     listen('ready', () => {
-      setConnection('online');
       setNotice('');
       void getConfig().catch(report);
       refresh();
@@ -164,7 +169,6 @@ export function useWorkspace(accountId: string) {
     });
     source.onerror = () => {
       if (!alive) return;
-      setConnection('retrying');
       void getConfig().catch(report);
     };
     for (const name of ['message.started', 'message.updated', 'message.done', 'tool.started', 'tool.finished']) {
@@ -203,6 +207,7 @@ export function useWorkspace(accountId: string) {
     listen<{ file: LocalFile }>('file.added', event => {
       setFiles(previous => mergeRows(previous, [event.file]));
     });
+    listen<InputRequest>('input.updated', recordInputRequest);
 
     void getConfig().catch(report);
     refresh();
@@ -211,7 +216,7 @@ export function useWorkspace(accountId: string) {
       alive = false;
       source.close();
     };
-  }, [loadRoom, markSeen, recordJob, recordMessage, refreshList]);
+  }, [loadRoom, markSeen, recordInputRequest, recordJob, recordMessage, refreshList]);
 
   async function create(): Promise<string> {
     if (creating.current) return creating.current;
@@ -252,8 +257,28 @@ export function useWorkspace(accountId: string) {
     recordJob(updated);
   }
 
+  async function retryJob(job: Job): Promise<Job> {
+    const updated = await request<Job>('/api/jobs/' + job.id + '/retry', { method: 'POST' });
+    recordJob(updated);
+    return updated;
+  }
+
+  async function resolveInput(id: string, choice: { file_id: string } | { repair_token: string }): Promise<void> {
+    const result = await request<{ input_request: InputRequest; job: Job; file: LocalFile | null }>(
+      '/api/input-requests/' + id + '/resolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(choice),
+      },
+    );
+    recordInputRequest(result.input_request);
+    recordJob(result.job);
+    const file = result.file;
+    if (file) setFiles(previous => mergeRows(previous, [file]));
+  }
+
   return {
     config, conversations, files, jobs, activeId, room: activeId ? rooms[activeId] ?? EMPTY_ROOM : EMPTY_ROOM,
-    seen, connection, notice, setNotice, toast, setToast, select, create, send, upload, retrySummary,
+    seen, notice, setNotice, toast, setToast, select, create, send, upload, retrySummary, retryJob, resolveInput,
   };
 }
