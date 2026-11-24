@@ -43,9 +43,15 @@ test -f .env || cp .env.example .env
 - **首页**保留历史会话、流式聊天、工具记录和当前会话任务。
 - **文件管理**支持上传、下载和将文件带入聊天分析。每个账号有自己的上传文件，同一账号可跨会话复用。三个内置题面样例供各账号使用。
 - **任务管理**按账号展示全部任务。可按状态筛选，按文件名或完整 ID 搜索。详情显示执行时间、退出码、标准输出和错误日志。长日志可以逐段阅读，任务结束后可下载完整文件。
-- **工具管理**展示当前可调用的 `submit_job`、`job_status` 和 `read_log` 的用途及参数。
+- **工具管理**提供 MCP 服务、工具列表和 Skills。新账号在「MCP 服务」中点击「添加本机 MCP」，完成工具发现后即可发起分析。升级前已存在的账号继续使用科研工具。
 
 账号密码以带随机盐的 scrypt 哈希保存，浏览器使用会过期的 HttpOnly 会话 Cookie。SQLite 根据会话所属账号筛选文件、对话、任务和日志，实时事件也按账号推送。[OWASP 密码存储](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) · [OWASP 会话管理](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)
+
+### MCP 服务和 Skills
+
+- **本机科研任务服务。** FastAPI 使用当前 Python 解释器运行 `python -m backend.app.research_mcp`，由官方 MCP SDK 管理 stdio 子进程。前端点击添加时调用 `tools/list`，为当前账号保存启用状态。三个科研工具是任务流程的必需工具。
+- **外部 MCP。** 在 `.env` 的 `MCP_HTTP_ENDPOINTS` 中用逗号分隔可供各账号选择的可信 Streamable HTTP 地址，重启后端后在工具管理连接。默认地址是公开的 AWS Knowledge。成功接入后显示发现的工具，按账号启用 Server 和具体工具。刷新保留单工具开关，已从上游移除的工具标为不可用。[AWS Knowledge 接入文档](https://awslabs.github.io/mcp/servers/aws-knowledge-mcp-server#configuration)
+- **文字型 Skill。** 在 Skills 页添加名称、触发短语和说明。可填入「科研结果报告」示例。启用后，请求中出现触发短语时加载这份说明，用来组织结果。工具权限仍由后端控制。
 
 导航图标使用 Lucide，任务详情参考了科研作业管理中同时呈现状态、退出码和原始日志的设计。[Lucide 图标](https://lucide.dev/icons) · [Seqera 运行详情](https://docs.seqera.io/platform-cloud/getting-started/quickstart-demo/view-run-information)
 
@@ -80,8 +86,9 @@ flowchart LR
     API --> Agent["手写 ReAct 循环"]
     Agent <-->|流式工具请求和观察| Model["DeepSeek Flash"]
     Agent --> MCPClient["MCP Client"]
-    MCPClient <-->|Streamable HTTP| MCPServer["MCP Server"]
-    MCPServer --> Tools["submit_job / job_status / read_log"]
+    MCPClient <-->|stdio| MCPServer["本机科研 MCP 子进程"]
+    MCPClient <-->|Streamable HTTP| RemoteMCP["已启用的外部 MCP"]
+    MCPServer -->|本机 IPC| Tools["submit_job / job_status / read_log"]
     Tools --> Jobs["本地任务管理器"]
     Jobs -->|固定命令和参数| Python["两个 Python 分析子进程"]
     Python --> Logs["stdout / stderr"]
@@ -93,13 +100,14 @@ flowchart LR
 ```
 
 - `backend/app/model.py` 解析 DeepSeek 流式正文、按索引拼齐工具参数。`backend/app/agent.py` 通过 MCP Client 获取工具结果，并回填对应的 `tool_call_id`。每阶段最多调用模型 6 轮。DeepSeek 的模型思考模式使用关闭配置，调用工具和消费结果的 ReAct 循环由应用实现。
-- `backend/app/mcp_tools.py` 定义 `submit_job`、`job_status`、`read_log` 三个函数，通过官方 SDK 的 `MCPServer.add_tool()` 逐个注册。后端启动后通过 `tools/list` 获取工具定义，通过 `tools/call` 获取结构化结果。MCP Server 与 Client 共用同一个后端进程，通过内部 ASGI 传输 Streamable HTTP 请求。后端把已认证的账号、会话和消息范围写入 MCP 请求元数据，服务端沿用现有权限检查。DeepSeek 收到的是工具定义、业务参数和结果。 [MCP 工具规范](https://modelcontextprotocol.io/specification/2026-07-28/server/tools) · [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)
+- `backend/app/research_mcp.py` 定义并注册 `submit_job`、`job_status`、`read_log`。`backend/app/mcp_tools.py` 的 Client 通过 `tools/list` 获取定义，并通过 `tools/call` 调用工具。Server 子进程使用标准输入和输出通信，内部转发使用本机命名管道或 Unix 域套接字。FastAPI 继续管理账号权限、SQLite、任务队列和通知。前端和 API 使用原来的 `8767`，本机 MCP 子进程无需监听 TCP 端口。[MCP stdio 规范](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio) · [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)
+- `backend/app/external_mcp.py` 负责外部 Server 连接和工具发现。后端按账号与两个启用开关筛选候选工具，执行前再次校验启用状态和工具自己的 JSON Schema。同名工具用各自的 Server 和工具标识定位。
 - `backend/app/jobs.py` 本地最多同时执行两个任务。每个脚本内部延时 4 秒，提交立即返回，单任务上限默认 60 秒。任务的退出码和输出由后端记录。任务结束时，助手查询同一个 ID，再读日志生成解释。
 - `backend/app/store.py` 管理 SQLite 中的账号与会话凭证、对话、工具记录、文件登记和任务。相同客户端消息的重发使用同一消息 ID，重复工具提交复用同一任务。重启时继续处理已排队的任务和计划重试，执行中的任务记为中断，待解释的终态可从原日志恢复。
 - `scripts/` 放两个可单独运行的脚本。统计以 A、C、G、T 为 GC 分母，IUPAC 歧义碱基计入总长度。ORF 取正链三个阅读框中最长的完整 `ATG` 到同框终止区间，坐标从 1 开始、含两端，等长取较早起点。`sample3` 的两处错误由同一个共享解析器收集。
 - `frontend/` 通过一个 SSE 连接接收消息增量、工具轨迹和任务通知。断线后从 SQLite 快照恢复。`var/` 保存 SQLite、上传文件和两路原始日志，工具预览每路最多约 8 KiB。任务记录可下载完整日志。模型调用失败时，系统仍能读取本机日志，并提供“重新解释”。
 
-这次交付采用单机、单个后端进程及固定分析工具。已实现的加分项包括 MCP 封装、主动完成通知、上传 FASTA 和关键用例测试。Docker Compose 留作后续选项。对照项目、计算基准和验收条件见评审文档。[技术方案](docs/02-技术调研与开发方案.md) · [样例基准与验收用例](docs/03-样例基准与验收用例.md)
+已实现的加分项包括 MCP 封装、主动完成通知、上传 FASTA 和关键用例测试。外部 MCP 的发现、分开启停以及按需加载 Skill 的方式参考了 Data Agent 的扩展管理实现。Docker Compose 留作后续选项。对照项目、计算基准和验收条件见评审文档。[技术方案](docs/02-技术调研与开发方案.md) · [样例基准与验收用例](docs/03-样例基准与验收用例.md)
 
 ## 失败任务与重跑
 

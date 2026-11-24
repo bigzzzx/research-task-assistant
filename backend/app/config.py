@@ -10,6 +10,7 @@ ANALYSES = ("seq_stats", "find_orf")
 UPLOAD_LIMIT = 5 * 1024 * 1024
 LOG_LIMIT = 8 * 1024
 DEFAULT_INPUT_TOKEN_BUDGET = 24_000
+DEFAULT_MCP_HTTP_ENDPOINTS = ("https://knowledge-mcp.global.api.aws",)
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class Settings:
     input_token_budget: int = DEFAULT_INPUT_TOKEN_BUDGET
     job_max_auto_retries: int = 2
     job_retry_delay: float = 3
+    mcp_http_endpoints: tuple[str, ...] = DEFAULT_MCP_HTTP_ENDPOINTS
 
     @classmethod
     def load(cls) -> "Settings":
@@ -38,10 +40,15 @@ class Settings:
         except ValueError:
             raise ValueError("DEEPSEEK_INPUT_TOKEN_BUDGET 必须是至少 4096 的整数。") from None
 
+        endpoints = os.environ.get("MCP_HTTP_ENDPOINTS", values.get("MCP_HTTP_ENDPOINTS"))
+        mcp_http_endpoints = DEFAULT_MCP_HTTP_ENDPOINTS if endpoints is None else tuple(
+            dict.fromkeys(url.strip() for url in endpoints.split(",") if url.strip())
+        )
         return cls(
             data_dir=(ROOT / value("APP_DATA_DIR", "var")).resolve(),
             model=value("DEEPSEEK_MODEL", "deepseek-flash"),
             base_url=value("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/"),
             api_key=value("DEEPSEEK_API_KEY"),
             input_token_budget=input_budget,
+            mcp_http_endpoints=mcp_http_endpoints,
         )

@@ -332,15 +332,30 @@
 .catalog-card { padding: 15px; background: #fff; border: 1px solid var(--line); border-radius: 9px; }
 .catalog-title { display: flex; align-items: center; gap: 8px; color: #245746; }
 .catalog-title h2 { font-size: 16px; overflow-wrap: anywhere; }
-.catalog-card p, .catalog-card dd { color: var(--muted); font-size: 14px; line-height: 1.6; }
+.catalog-card p { color: var(--muted); font-size: 14px; line-height: 1.6; }
 .catalog-card p { margin-top: 10px; }
-.catalog-card dl { margin: 12px 0 0; }
-.catalog-card dl > div { padding-top: 8px; margin-top: 8px; border-top: 1px solid #e4ece6; }
-.catalog-card dt { font-size: 14px; font-weight: 650; }
-.catalog-card dt small { color: #566d64; font-weight: 500; }
-.catalog-card dd { margin: 5px 0 0; }
-.catalog-options { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
-.catalog-options code { border-radius: 4px; background: #eaf3ed; padding: 1px 5px; color: #295a48; }
+.extension-tabs, .extension-row, .extension-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.extension-tabs { margin-bottom: 16px; }
+.extension-tabs button[aria-pressed="true"] { color: #fff; background: #1b6451; border-color: #1b6451; }
+.extension-stack { display: grid; gap: 12px; }
+.extension-stack .catalog-card { min-width: 0; }
+.extension-stack code { overflow-wrap: anywhere; }
+.extension-switch { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.extension-switch input { accent-color: #246c57; }
+.extension-form { display: grid; gap: 10px; max-width: 680px; margin-top: 12px; }
+.extension-form label:not(.extension-switch) { display: grid; gap: 4px; min-width: 0; }
+.extension-form :is(input:not([type="checkbox"]), select, textarea) {
+  width: 100%;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f9fbfa;
+  color: inherit;
+  font: inherit;
+}
+.extension-details { margin-top: 10px; }
+.extension-details pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f4f8f5; padding: 8px; border-radius: 6px; }
 
 @media (max-width: 1080px) {
   .workspace { grid-template-columns: 55px 204px minmax(0, 1fr); }

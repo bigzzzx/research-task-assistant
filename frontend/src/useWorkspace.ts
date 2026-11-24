@@ -167,6 +167,7 @@ export function useWorkspace(accountId: string) {
       refreshResources();
       if (activeRef.current) void loadRoom(activeRef.current).catch(report);
     });
+    listen('config.updated', () => { void getConfig().catch(report); });
     source.onerror = () => {
       if (!alive) return;
       void getConfig().catch(report);

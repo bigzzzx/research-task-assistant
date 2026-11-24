@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { ClipboardList, FileText, Plus, Terminal, X } from 'lucide-react';
-import { accountUrl, type FailureCategory, type Job, type JobLog, type JobState, type LocalFile, request, type ToolDefinition } from './api';
+import { ClipboardList, FileText, Plus, X } from 'lucide-react';
+import { accountUrl, type FailureCategory, type Job, type JobLog, type JobState, type LocalFile, request } from './api';
 import { ANALYSIS, STATES, Status, showSize } from './display';
 import { errorText } from './useWorkspace';
 
@@ -326,48 +326,6 @@ export function TaskManager({ jobs, onConversation, onRetry }: {
       )}
       {detail && <TaskDetail key={detail.id} job={detail} clock={clock} onClose={() => setSelected(undefined)}
         attempts={attempts} onSelect={setSelected} onRetry={onRetry} onConversation={onConversation} />}
-    </div>
-  );
-}
-
-export function ToolManager() {
-  const [tools, setTools] = useState<ToolDefinition[]>();
-  const [error, setError] = useState('');
-  useEffect(() => {
-    const controller = new AbortController();
-    void request<ToolDefinition[]>('/api/tools', { signal: controller.signal }).then(result => {
-      if (!controller.signal.aborted) setTools(result);
-    }).catch(failure => {
-      if (!controller.signal.aborted) setError(errorText(failure));
-    });
-    return () => controller.abort();
-  }, []);
-
-  return (
-    <div className="management-content">
-      <header className="management-heading">
-        <div><h1>工具管理</h1><p>查看助手可调用的内置工具、参数和用途。</p></div>
-      </header>
-      {error && <p className="tone-error" role="alert">{error}</p>}
-      {!error && !tools && <p className="muted" role="status">正在读取工具目录…</p>}
-      <div className="tool-catalog">
-        {tools?.map(tool => (
-          <article className="catalog-card" key={tool.name}>
-            <div className="catalog-title"><Terminal size={18} aria-hidden="true" /><h2><code>{tool.name}</code></h2></div>
-            <p>{tool.description}</p>
-            <dl>{Object.entries(tool.parameters.properties).map(([name, parameter]) => (
-              <div key={name}>
-                <dt><code>{name}</code> <small>{tool.parameters.required.includes(name) ? '必填' : '可选'}</small></dt>
-                <dd>{parameter.description}
-                  {parameter.enum && <div className="catalog-options">{parameter.enum.map(option => (
-                    <code key={option}>{option}</code>
-                  ))}</div>}
-                </dd>
-              </div>
-            ))}</dl>
-          </article>
-        ))}
-      </div>
     </div>
   );
 }

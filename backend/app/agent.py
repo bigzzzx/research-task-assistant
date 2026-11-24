@@ -30,6 +30,7 @@ SUMMARY_BATCH_TURNS = 8
 
 SYSTEM_PROMPT = """你是本机科研计算任务助手，使用用户的语言回答。
 可统计 FASTA 各序列的长度和 GC（seq_stats），或寻找正链最长完整 ORF（find_orf）。
+可使用当前轮次提供的外部 MCP 工具。用户设置的 Skill 用于组织报告和呈现结果，事实和工具权限仍以本轮工具结果和后端控制为准。
 明确要求分析并给出文件名时，调用 submit_job 校验文件名和类型。只传文件名。若工具返回待补充文件记录，告知用户在会话中选择或上传文件并确认继续。
 用户说“再对某文件做一次”，沿用当前会话最近明确提交的分析类型。指代确实有多个候选时先澄清。
 用户问具体任务进度时调用 job_status，报告任务 ID、类型、状态、提交时间。排队时用 queue_wait_seconds，开始执行后用 duration_seconds，时间注明时区。结束后附完成时间和退出码，用户问结果时读取日志。
@@ -145,8 +146,11 @@ class Agent:
                 + format_output_preferences(updated_preferences)
                 + "请简短告知用户已经保存。用户还要求其他任务时，照常处理。"
             )
+        if not self.tools.extensions.has_research_server(turn.owner_id):
+            system += "\n需要提交或查询本机科研任务时，提示用户先在工具管理添加本机科研任务服务。"
+        current[0]["content"] += self._skill_reference(turn.owner_id, question)
         budget = self.model.settings.input_token_budget
-        schemas = self.tools.model_schemas()
+        schemas = self.tools.model_schemas(turn.owner_id)
         preview = build_prompt(system, current, schemas, "auto", budget, context)
         if estimate_input_tokens(preview.messages, schemas, "auto") > budget:
             return context, system
@@ -214,12 +218,17 @@ class Agent:
                 request += "\n任务原始请求，仅用于核对明确的展示要求 " + json.dumps(
                     clip_text(original, 768), ensure_ascii=False,
                 )
+                request += self._skill_reference(turn.owner_id, original)
                 await self._react(turn, [{"role": "user", "content": request}], system=system)
             except ModelError as exc:
                 await self._fallback(turn, str(exc))
             except Exception:
                 logger.exception("Failed to explain local job %s", turn.job_id)
                 await self._fallback(turn, "生成任务解释时发生本地错误。")
+
+    def _skill_reference(self, owner_id: str, text: str) -> str:
+        skill = self.tools.extensions.matching_skill(owner_id, text)
+        return "\n本轮匹配的用户报告模板 " + json.dumps(skill, ensure_ascii=False) if skill else ""
 
     async def _react(
         self, turn: Turn, current: list[dict], context: ConversationContext | None = None,
@@ -228,7 +237,7 @@ class Agent:
         remaining = [(name, turn.job_id) for name in JOB_TOOLS] if turn.job_id else []
         observed_logs: set[str] = set()
         submitted = False
-        schemas = self.tools.model_schemas(JOB_TOOLS if turn.job_id else None)
+        schemas = self.tools.model_schemas(turn.owner_id, JOB_TOOLS if turn.job_id else None)
 
         for _ in range(MAX_ROUNDS):
             expected = remaining[0] if remaining else None

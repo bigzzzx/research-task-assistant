@@ -19,6 +19,8 @@ from .agent import Agent
 from .auth import Account, current_account, router as auth_router
 from .config import ROOT, SAMPLES, UPLOAD_LIMIT, Settings
 from .events import Events
+from .extension_api import router as extension_router
+from .extensions import ExtensionStore
 from .input_repair import FormatRepair, input_diagnostics, preview_repair
 from .jobs import Jobs, TERMINAL, log_page, registered_input
 from .mcp_tools import open_tool_client
@@ -61,10 +63,12 @@ def create_app(
         model = DeepSeek(resolved, model_transport)
         jobs = Jobs(resolved, store, events, lambda job: agent.complete(job))
         try:
-            async with open_tool_client(Tools(store, jobs)) as tools:
+            extensions = ExtensionStore(store.db)
+            async with open_tool_client(Tools(store, jobs), extensions, resolved.mcp_http_endpoints) as tools:
                 agent = Agent(store, events, model, tools)
                 app.state.settings, app.state.events, app.state.store = resolved, events, store
                 app.state.agent, app.state.jobs, app.state.tools = agent, jobs, tools
+                app.state.extensions = extensions
                 app.state.password_slots = asyncio.Semaphore(2)
                 try:
                     for pending in store.recover():
@@ -82,6 +86,7 @@ def create_app(
     app = FastAPI(title="科研计算任务助手", lifespan=lifespan)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
     app.include_router(auth_router)
+    app.include_router(extension_router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError):
@@ -111,7 +116,8 @@ def create_app(
     async def config(account: SignedIn):
         resolved = app.state.settings
         return {"model": resolved.model, "key_configured": bool(resolved.api_key),
-                "samples": list(SAMPLES), "upload_limit": UPLOAD_LIMIT}
+                "samples": list(SAMPLES), "upload_limit": UPLOAD_LIMIT,
+                "research_mcp_added": app.state.extensions.has_research_server(account.id)}
 
     @app.get("/api/preferences", response_model=OutputPreferences)
     async def output_preferences(account: SignedIn):
@@ -380,7 +386,7 @@ def create_app(
 
     @app.get("/api/tools")
     async def tool_catalog(account: SignedIn):
-        return [tool["function"] for tool in app.state.tools.model_schemas()]
+        return app.state.tools.catalog(account.id)
 
     dist = frontend_dir or ROOT / "frontend" / "dist"
     if (dist / "assets").is_dir():

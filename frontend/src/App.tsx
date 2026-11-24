@@ -9,7 +9,8 @@ import { accountUrl, bindAccount, request, RequestError, SESSION_CHANGED,
   type Account, type Analysis, type Job, type LocalFile, type Message } from './api';
 import { ANALYSIS, Status, showSize } from './display';
 import { InputRecovery } from './InputRecovery';
-import { FileManager, TaskManager, ToolManager } from './Management';
+import { FileManager, TaskManager } from './Management';
+import { ToolManager } from './ToolManager';
 import { Navigation, useSection } from './Navigation';
 import { errorText, useWorkspace } from './useWorkspace';
 
@@ -50,6 +51,8 @@ type ToolOutput = {
   stderr?: string;
   display_stdout?: string;
   gc_precision_note?: string;
+  tool?: string;
+  server_name?: string;
   job_id?: string;
   state?: Job['state'];
   analysis_type?: Analysis;
@@ -134,7 +137,8 @@ function ToolCards({ invocation, observations }: { invocation: Message; observat
           <details className="tool" key={call.id}>
             <summary>
               <span className="tool-glyph" aria-hidden="true">⌘</span>
-              <code>{call.function.name}</code>
+              <code>{output?.tool ?? call.function.name}</code>
+              {output?.server_name && <span className="tool-source">{output.server_name}</span>}
               {invocation.source === 'system' && <span className="tool-source">系统读取</span>}
               <span className={'tool-status ' + (output?.ok === false ? 'tone-error' : '')}>
                 {observed ? output?.ok === false ? '参数或调用有误' : '已返回' :
@@ -453,6 +457,12 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
               <div className="config-banner">
                 <strong>DeepSeek 尚未配置</strong>
                 <span>在 <code>.env</code> 填入 <code>DEEPSEEK_API_KEY</code> 后重启后端，即可发送消息。</span>
+              </div>
+            )}
+            {config && !config.research_mcp_added && (
+              <div className="config-banner">
+                <strong>连接科研工具后即可分析样例和上传文件</strong>
+                <button type="button" className="secondary-button" onClick={() => navigate('tools')}>添加本机 MCP</button>
               </div>
             )}
             <div className="chat-scroll" ref={scroll} onScroll={() => {

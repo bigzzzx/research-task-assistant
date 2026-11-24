@@ -116,8 +116,40 @@ export interface LocalFile {
 
 export interface ToolDefinition {
   name: string;
+  display_name: string;
   description: string;
-  parameters: { properties: Record<string, { type: string; description: string; enum?: string[] }>; required: string[] };
+  parameters: Record<string, unknown>;
+  server_name: string;
+  transport: 'stdio' | 'streamable-http';
+  required: boolean;
+  enabled: boolean;
+  available: boolean;
+  server_enabled: boolean;
+}
+
+export interface McpServer {
+  id: string;
+  name: string;
+  endpoint: string;
+  tool_count: number;
+  enabled: boolean;
+  available: boolean;
+  synced_at: string;
+}
+
+export interface McpSettings {
+  research_added: boolean;
+  research_command: string[];
+  endpoints: string[];
+  servers: McpServer[];
+}
+
+export interface Skill {
+  id: string;
+  name: string;
+  trigger: string;
+  instructions: string;
+  enabled: boolean;
 }
 
 export interface JobLog {
@@ -132,6 +164,7 @@ export interface Config {
   key_configured: boolean;
   samples: string[];
   upload_limit: number;
+  research_mcp_added: boolean;
 }
 
 export interface Room {
