@@ -33,6 +33,44 @@ class JobRecoveryTests(IsolatedAsyncioTestCase):
         self.settings = Settings(data_dir=Path(temporary.name), api_key="fixture-key")
         self.model = ModelFixture()
 
+    async def test_next_question_reminds_once_and_allows_explicit_recovery(self):
+        async with service(self.settings, self.model) as client:
+            room = await create_room(client)
+            await send(client, room, "broken", "统计 sample3.fasta 的 GC 含量")
+            failure = await until(client, room, lambda value: terminal(value, 1))
+            failed = failure["jobs"][0]
+            request_id = failure["input_requests"][0]["id"]
+            self.assertEqual(failed["state"], "failed")
+
+            other_room = await create_room(client)
+            self.assertNotIn("input_reminder", await send(client, other_room, "other", "你好"))
+
+            next_turn = await send(client, room, "new-question", "统计 sample1.fasta 的 GC 含量")
+            reminder = next_turn["input_reminder"]
+            self.assertIn("sample3.fasta", reminder["content"])
+            self.assertIn("暂未重新运行", reminder["content"])
+            duplicate = await send(client, room, "new-question", "统计 sample1.fasta 的 GC 含量")
+            self.assertEqual(duplicate["input_reminder"]["id"], reminder["id"])
+            continued = await until(client, room, lambda value: terminal(value, 2))
+            submitted = next(message for message in continued["messages"]
+                             if message["turn_id"] == next_turn["id"] and message["kind"] == "invocation")
+            self.assertLess(next_turn["id"], reminder["id"])
+            self.assertLess(reminder["id"], submitted["id"])
+            self.assertEqual(continued["jobs"][0]["state"], "succeeded")
+            self.assertEqual(continued["input_requests"][0]["reminder_message_id"], reminder["id"])
+            self.assertIsNone(continued["input_requests"][0]["resolved_job_id"])
+
+            self.assertNotIn("input_reminder", await send(client, room, "again", "你好"))
+            pending = (await client.get(room)).raise_for_status().json()
+            self.assertEqual([row["id"] for row in pending["messages"] if row["kind"] == "input_reminder"],
+                             [reminder["id"]])
+            response = await client.post(f"/api/input-requests/{request_id}/resolve", json={"file_id": "sample2.fasta"})
+            self.assertEqual(response.status_code, 202)
+            self.assertEqual(response.json()["job"]["retry_of_job_id"], failed["id"])
+            result = await until(client, room, lambda value: terminal(value, 3))
+            self.assertEqual(result["jobs"][-1]["state"], "failed")
+            self.assertEqual(result["jobs"][0]["state"], "succeeded")
+
     async def test_transient_launch_retry_survives_restart_and_keeps_the_first_attempt(self):
         with patch("backend.app.jobs.subprocess.Popen", side_effect=BlockingIOError(errno.EAGAIN, "fixture busy")):
             async with service(self.settings, self.model) as client:

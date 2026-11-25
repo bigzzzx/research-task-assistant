@@ -110,7 +110,8 @@ class ContextIntegrationTests(IsolatedAsyncioTestCase):
             raw_log = "开始\n" + "甲乙" * 2300 + "\n结束\n"
             app.state.jobs.log_path(job["id"], "stdout").write_bytes(raw_log.encode())
             for index in range(3):
-                saved_turn(store, conversation_id, f"前文第 {index} 轮" + "事" * 650)
+                # Leave room for the fixed tool schemas and one prior turn before the log arrives.
+                saved_turn(store, conversation_id, f"前文第 {index} 轮" + "事" * 375)
             sent = await send(client, room, "read", "读取任务 " + job["id"] + " 的日志。")
             snapshot = await until(client, room, lambda data: any(
                 message["id"] == sent["id"] and message["status"] == "done" for message in data["messages"]

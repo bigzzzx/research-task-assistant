@@ -135,6 +135,20 @@ class AccountTests(IsolatedAsyncioTestCase):
 
 
 class LegacyWorkspaceTests(TestCase):
+    def test_history_lists_conversations_with_content(self):
+        with TemporaryDirectory() as directory:
+            with closing(Store(Path(directory) / "assistant.sqlite3", ROOT / "data")) as store:
+                owner = store.create_user("researcher", "researcher", "unused-in-history-test")["id"]
+                empty = store.new_conversation(owner)["id"]
+                conversation = store.new_conversation(owner)["id"]
+                with_file = store.new_conversation(owner)["id"]
+                self.assertEqual(store.conversations(owner), [])
+
+                store.user_message(conversation, "first-message", "新会话")
+                store.add_file(owner, "local-file", "records.fa", 10, with_file)
+                self.assertEqual({row["id"] for row in store.conversations(owner)}, {conversation, with_file})
+                self.assertIsNotNone(store.owned_conversation(owner, empty))
+
     def test_pre_account_sqlite_records_require_explicit_assignment(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "assistant.sqlite3"

@@ -5,7 +5,7 @@ from unittest import TestCase
 
 from backend.app.config import LOG_LIMIT, ROOT
 from backend.app.jobs import LOG_PAGE_BYTES, bounded_log, log_page
-from backend.app.tools import format_gc_log
+from backend.app.tools import format_analysis_log
 from scripts.fasta import InvalidFasta, Record, read_fasta
 from scripts.find_orf import find_orf
 from scripts.seq_stats import seq_stats
@@ -59,12 +59,12 @@ class AnalysisTests(TestCase):
         for places, expected in [(0, "79%"), (1, "78.9%"), (2, "78.95%")]:
             stdout = json.dumps(raw) + "\n"
             with self.subTest(places=places):
-                result = format_gc_log({"stdout": stdout}, places)
+                result = format_analysis_log({"stdout": stdout}, places)
                 self.assertEqual(result["stdout"], stdout)
                 self.assertEqual(json.loads(result["display_stdout"])["gc_display"], expected)
 
         old = {"stdout": json.dumps({"id": "example", "length_nt": 19, "gc_pct": 78.95})}
-        result = format_gc_log(old, 1)
+        result = format_analysis_log(old, 1)
         self.assertEqual(json.loads(result["display_stdout"])["gc_display"], "78.95%")
         self.assertIn("gc_precision_note", result)
 

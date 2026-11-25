@@ -30,15 +30,12 @@ def client_for(app):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1")
 
 
-async def sign_in(client, username, *, add_research=True):
+async def sign_in(client, username):
     credentials = {"username": username, "password": TEST_PASSWORD}
     response = await client.post("/api/auth/register", json=credentials)
     if response.status_code == 409:
         response = await client.post("/api/auth/login", json=credentials)
     assert response.status_code in {200, 201}, response.text
-    if add_research and not (await client.get("/api/config")).json()["research_mcp_added"]:
-        added = await client.post("/api/mcp/research")
-        assert added.status_code == 201, added.text
     return response.json()
 
 
