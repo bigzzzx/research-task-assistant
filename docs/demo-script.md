@@ -45,7 +45,7 @@
    ```powershell
    .\.venv\Scripts\python.exe -m pip install playwright
    .\.venv\Scripts\python.exe -m playwright install chromium
-   .\.venv\Scripts\python.exe demo\record_demo.py --base-url http://127.0.0.1:8790 --pace 2.0
+   .\.venv\Scripts\python.exe demo\record_demo.py --base-url http://127.0.0.1:8790 --pace 2.4
    ```
 
    `demo/record_demo.py` 会：
