@@ -1,4 +1,4 @@
-"""Start only the two analysis scripts and persist each observed transition."""
+"""Run analysis jobs and persist each observed transition."""
 
 import asyncio
 import codecs
@@ -12,7 +12,8 @@ from pathlib import Path
 import subprocess
 import sys
 
-from .config import LOG_LIMIT, ROOT, ANALYSES, Settings
+from .config import ANALYSES, CUSTOM_ANALYSIS, LOG_LIMIT, ROOT, Settings
+from .docker_runner import run_python_job
 from .events import Events
 from .failures import Failure, INTERRUPTED, execution_failure, launch_failure
 from .store import Store
@@ -124,8 +125,14 @@ class Jobs:
 
     async def _execute(self, job: dict) -> tuple[int | None, Failure | None]:
         job_id = job["id"]
+        custom = job["analysis_type"] == CUSTOM_ANALYSIS
         script = SCRIPTS.get(job["analysis_type"])
-        if not script or not script.is_file():
+        source = None
+        if custom:
+            source = self.store.analysis_script_source(job["owner_id"], job["script_id"])
+            if source is None:
+                return None, Failure("configuration", "SCRIPT_NOT_FOUND", "preparation", "找不到此任务的脚本版本。")
+        elif not script or not script.is_file():
             return None, Failure("configuration", "SCRIPT_NOT_FOUND", "preparation", "找不到此任务类型的分析脚本。")
         file = self.store.owned_file(job["owner_id"], job["file_id"])
         try:
@@ -139,8 +146,12 @@ class Jobs:
 
         log_path = self.log_path(job_id, "stderr")
         try:
-            self.directory(job_id).mkdir(parents=True, exist_ok=True)
+            directory = self.directory(job_id)
+            directory.mkdir(parents=True, exist_ok=True)
             with self.log_path(job_id, "stdout").open("wb") as stdout, log_path.open("wb") as stderr:
+                if custom:
+                    return await run_python_job(job_id, directory, source, file_path, stdout, stderr,
+                                                self.settings.job_timeout)
                 exit_code, failure = await self._run_process(script, file_path, stdout, stderr)
         except OSError as exc:
             if exc.errno == errno.ENOSPC:
@@ -223,4 +234,7 @@ def status_view(job: dict) -> dict:
             "duration_seconds", "queue_wait_seconds", "status_at", "failure_category", "failure_code", "failure_stage",
             "retry_of_job_id", "attempt_number", "retry_kind", "available_at", "next_attempt_id", "next_attempt_at",
             "input_request_id")
-    return {"ok": True, "job_id": job["id"], **{key: job[key] for key in keys}}
+    status = {"ok": True, "job_id": job["id"], **{key: job[key] for key in keys}}
+    if job.get("script_id"):
+        status.update(analysis_type=job["task_type"], script_name=job["script_name"], script_sha256=job["script_sha256"])
+    return status

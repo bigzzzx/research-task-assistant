@@ -7,7 +7,7 @@ import re
 
 from scripts.seq_stats import gc_percentage
 
-from .config import ANALYSES
+from .config import ANALYSES, CUSTOM_ANALYSIS, normalize_task_type
 from .jobs import Jobs, status_view
 from .store import Store
 
@@ -19,8 +19,8 @@ DEFINITIONS = {
         {
             "analysis_type": {
                 "type": "string",
-                "enum": list(ANALYSES),
-                "description": "seq_stats 为长度和 GC 统计，find_orf 为正链最长完整 ORF。",
+                "description": "任务类型标识。seq_stats 为长度和 GC 统计，find_orf 为正链最长完整 ORF。"
+                               "自定义任务使用当前账号登记的类型标识。",
             },
             "filename": {"type": "string", "description": "用户指定的 FASTA 文件名，如 sample1.fasta。缺失时可提示补传。"},
         },
@@ -51,31 +51,34 @@ def find_job(store: Store, conversation_id: str, job_id: str) -> dict | None:
     return matches[0] if len(matches) == 1 else None
 
 
-def format_gc_log(log: dict, decimal_places: int) -> dict:
+def format_analysis_log(log: dict, decimal_places: int | None, order: str = "file") -> dict:
     """Add a display preview and keep the original log available for inspection."""
-    lines = []
+    lines = log["stdout"].splitlines()
+    rows = []
     legacy_precision = False
-    for line in log["stdout"].splitlines():
+    for index, line in enumerate(lines):
         try:
             row = json.loads(line)
         except ValueError:
-            lines.append(line)
             continue
-        if not isinstance(row, dict) or "gc_pct" not in row:
-            lines.append(line)
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str):
             continue
 
-        saved_percentage = row.pop("gc_pct")
-        gc_count, known_bases = row.get("gc_count"), row.get("known_bases")
-        if type(gc_count) is int and type(known_bases) is int and 0 <= gc_count <= known_bases:
-            percentage = gc_percentage(gc_count, known_bases, decimal_places)
-            row["gc_display"] = f"{percentage}%" if percentage is not None else None
-        elif isinstance(saved_percentage, (int, float)):
-            row["gc_display"] = f"{saved_percentage:.2f}%"
-            legacy_precision |= decimal_places != 2
-        else:
-            row["gc_display"] = None
-        lines.append(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
+        if decimal_places is not None and "gc_pct" in row:
+            saved_percentage = row.pop("gc_pct")
+            gc_count, known_bases = row.get("gc_count"), row.get("known_bases")
+            if type(gc_count) is int and type(known_bases) is int and 0 <= gc_count <= known_bases:
+                percentage = gc_percentage(gc_count, known_bases, decimal_places)
+                row["gc_display"] = f"{percentage}%" if percentage is not None else None
+            elif isinstance(saved_percentage, (int, float)):
+                row["gc_display"] = f"{saved_percentage:.2f}%"
+                legacy_precision |= decimal_places != 2
+            else:
+                row["gc_display"] = None
+        rows.append((index, row))
+    ordered = sorted(rows, key=lambda pair: pair[1]["id"]) if order == "sequence_id" else rows
+    for (index, _), (_, row) in zip(rows, ordered):
+        lines[index] = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
     result = {**log, "display_stdout": "\n".join(lines)}
     if legacy_precision:
         result["gc_precision_note"] = "这份历史日志只保存了两位小数，按记录中的精度显示。"
@@ -108,8 +111,13 @@ class Tools:
         return status_view(job) if name == "job_status" else self.jobs.log_preview(job)
 
     def _submit(self, owner_id: str, conversation_id: str, turn_id: int, analysis_type: str, filename: str) -> dict:
-        if analysis_type not in ANALYSES:
-            return tool_error("UNKNOWN_ANALYSIS", "可用的分析是 seq_stats 和 find_orf。")
+        task_type = normalize_task_type(analysis_type)
+        script_id = None
+        if task_type not in ANALYSES:
+            script_id = self.store.latest_analysis_script_id(owner_id, task_type)
+            if not script_id:
+                return tool_error("UNKNOWN_ANALYSIS", "当前账号没有该任务类型，可在任务管理查看已登记的类型。")
+        runner_type = CUSTOM_ANALYSIS if script_id else task_type
         if any(char in filename for char in "/\\:"):
             return tool_error("INVALID_FILENAME", "请使用已有样例或本账号上传的文件名。")
 
@@ -119,7 +127,9 @@ class Tools:
         if not matches and not PurePath(key).suffix:
             matches = [item for item in files if PurePath(item["name_key"]).stem == key]
         if not matches:
-            pending, created = self.store.request_input(conversation_id, turn_id, analysis_type, filename.strip())
+            pending, created = self.store.request_input(
+                conversation_id, turn_id, runner_type, filename.strip(), script_id=script_id,
+            )
             if created:
                 self.jobs.events.send(owner_id, "input.updated", pending)
             return {**tool_error("FILE_NOT_FOUND", "未找到该文件。请在待补充文件卡片选择或上传文件，再确认继续。"),
@@ -127,13 +137,15 @@ class Tools:
         if len(matches) > 1:
             return tool_error("AMBIGUOUS_FILE", "有多个同名文件，请选择带扩展名的完整文件名。")
 
-        job, created = self.store.submit(conversation_id, turn_id, matches[0]["id"], analysis_type)
+        job, created = self.store.submit(
+            conversation_id, turn_id, matches[0]["id"], runner_type, script_id=script_id,
+        )
         if created:
             self.jobs.enqueue(job)
         return {
             "ok": True,
             "job_id": job["id"],
             "state": job["state"],
-            "analysis_type": analysis_type,
+            "analysis_type": task_type,
             "filename": job["filename"],
         }

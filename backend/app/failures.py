@@ -56,6 +56,7 @@ def execution_failure(exit_code: int, log_path: Path) -> Failure:
                 return Failure("input", issue["code"], "input")
     if re.search(r"^(?:ModuleNotFoundError|ImportError):", end, re.MULTILINE):
         return Failure("configuration", "IMPORT_FAILED", "execution", "分析脚本加载依赖失败，请检查错误日志。")
-    if re.search(r"^MemoryError(?::[^\r\n]*)?$", end, re.MULTILINE):
+    # Windows job logs end lines with CRLF, so the anchor has to tolerate the carriage return.
+    if re.search(r"^MemoryError(?::[^\r\n]*)?\r?$", end, re.MULTILINE):
         return Failure("resource_limit", "MEMORY_LIMIT", "execution", "分析进程内存不足，请调整资源或输入规模。")
     return Failure("unknown", "UNCLASSIFIED_EXIT", "execution")

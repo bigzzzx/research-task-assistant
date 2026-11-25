@@ -3,11 +3,11 @@
 import json
 import re
 import sqlite3
-import unicodedata
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from mcp.types import Tool
 
+from .skills import SkillDocument, render_skill
 from .store import now
 
 RESEARCH_SERVER_NAME = "本机科研任务服务"
@@ -18,21 +18,21 @@ class ExtensionStore:
         self.db = db
         with db:
             db.execute("BEGIN IMMEDIATE")
-            columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
-            if "research_mcp_added" not in columns:
-                db.execute("ALTER TABLE users ADD COLUMN research_mcp_added INTEGER NOT NULL DEFAULT 0")
-                db.execute("UPDATE users SET research_mcp_added=1")
             db.execute("""
                 CREATE TABLE IF NOT EXISTS mcp_servers (
                     id TEXT PRIMARY KEY,
                     owner_id TEXT NOT NULL REFERENCES users(id),
                     name TEXT NOT NULL,
                     endpoint TEXT NOT NULL,
+                    transport TEXT NOT NULL DEFAULT 'streamable-http',
                     enabled INTEGER NOT NULL DEFAULT 1,
                     synced_at TEXT NOT NULL,
                     UNIQUE(owner_id, endpoint)
                 )
             """)
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(mcp_servers)")}
+            if "transport" not in columns:
+                db.execute("ALTER TABLE mcp_servers ADD COLUMN transport TEXT NOT NULL DEFAULT 'streamable-http'")
             db.execute("""
                 CREATE TABLE IF NOT EXISTS mcp_tools (
                     server_id TEXT NOT NULL REFERENCES mcp_servers(id) ON DELETE CASCADE,
@@ -46,25 +46,35 @@ class ExtensionStore:
                 )
             """)
             db.execute("""
-                CREATE TABLE IF NOT EXISTS skills (
+                CREATE TABLE IF NOT EXISTS disabled_research_tools (
+                    owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    PRIMARY KEY(owner_id, name)
+                )
+            """)
+            initialized = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_skills'").fetchone()
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS agent_skills (
                     id TEXT PRIMARY KEY,
                     owner_id TEXT NOT NULL REFERENCES users(id),
                     name TEXT NOT NULL,
-                    trigger TEXT NOT NULL,
-                    trigger_key TEXT NOT NULL,
-                    instructions TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    document TEXT NOT NULL,
+                    files TEXT NOT NULL DEFAULT '{}',
                     enabled INTEGER NOT NULL DEFAULT 1,
-                    UNIQUE(owner_id, trigger_key)
+                    UNIQUE(owner_id, name)
                 )
             """)
-
-    def has_research_server(self, owner_id: str) -> bool:
-        row = self.db.execute("SELECT research_mcp_added FROM users WHERE id=?", (owner_id,)).fetchone()
-        return bool(row and row["research_mcp_added"])
-
-    def add_research_server(self, owner_id: str) -> None:
-        with self.db:
-            self.db.execute("UPDATE users SET research_mcp_added=1 WHERE id=?", (owner_id,))
+            if not initialized and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='skills'").fetchone():
+                rows = db.execute("SELECT id, owner_id, name, trigger, instructions, enabled FROM skills").fetchall()
+                for row in rows:
+                    name = "legacy-" + row["id"]
+                    description = f'{row["name"]}。当用户希望完成相关任务时使用。原触发短语：{row["trigger"]}'
+                    document = render_skill(name, description, row["instructions"])
+                    db.execute("""
+                        INSERT INTO agent_skills (id, owner_id, name, description, document, enabled)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (row["id"], row["owner_id"], name, description, document, row["enabled"]))
 
     def servers(self, owner_id: str) -> list[dict]:
         rows = self.db.execute("""
@@ -77,12 +87,12 @@ class ExtensionStore:
         row = self.db.execute("SELECT * FROM mcp_servers WHERE id=? AND owner_id=?", (server_id, owner_id)).fetchone()
         return dict(row) if row else None
 
-    def add_server(self, owner_id: str, name: str, endpoint: str, tools: list[Tool]) -> str:
+    def add_server(self, owner_id: str, name: str, endpoint: str, transport: str, tools: list[Tool]) -> str:
         server_id = uuid4().hex
         with self.db:
             self.db.execute("""
-                INSERT INTO mcp_servers (id, owner_id, name, endpoint, synced_at) VALUES (?, ?, ?, ?, ?)
-            """, (server_id, owner_id, name, endpoint, now()))
+                INSERT INTO mcp_servers (id, owner_id, name, endpoint, transport, synced_at) VALUES (?, ?, ?, ?, ?, ?)
+            """, (server_id, owner_id, name, endpoint, transport, now()))
             self._save_catalog(server_id, tools)
         return server_id
 
@@ -122,9 +132,23 @@ class ExtensionStore:
                 server_id IN (SELECT id FROM mcp_servers WHERE owner_id=?)
             """, (enabled, function_name, owner_id)).rowcount)
 
-    def remote_tools(self, owner_id: str, function_name: str | None = None) -> list[dict]:
+    def disabled_research_tools(self, owner_id: str) -> set[str]:
+        rows = self.db.execute("SELECT name FROM disabled_research_tools WHERE owner_id=?", (owner_id,))
+        return {row["name"] for row in rows}
+
+    def set_research_tool_enabled(self, owner_id: str, name: str, enabled: bool) -> None:
+        with self.db:
+            if enabled:
+                self.db.execute("DELETE FROM disabled_research_tools WHERE owner_id=? AND name=?", (owner_id, name))
+            else:
+                self.db.execute("""
+                    INSERT INTO disabled_research_tools (owner_id, name) VALUES (?, ?)
+                    ON CONFLICT(owner_id, name) DO NOTHING
+                """, (owner_id, name))
+
+    def external_tools(self, owner_id: str, function_name: str | None = None) -> list[dict]:
         rows = self.db.execute("""
-            SELECT t.*, s.name AS server_name, s.enabled AS server_enabled, s.endpoint
+            SELECT t.*, s.name AS server_name, s.enabled AS server_enabled, s.endpoint, s.transport
             FROM mcp_tools t JOIN mcp_servers s ON s.id=t.server_id
             WHERE s.owner_id=? AND (? IS NULL OR t.function_name=?) ORDER BY s.name, t.name, t.function_name
         """, (owner_id, function_name, function_name))
@@ -132,32 +156,37 @@ class ExtensionStore:
 
     def skills(self, owner_id: str) -> list[dict]:
         rows = self.db.execute("""
-            SELECT id, name, trigger, instructions, enabled FROM skills WHERE owner_id=? ORDER BY name, id
+            SELECT id, name, description, enabled FROM agent_skills WHERE owner_id=? ORDER BY name
         """, (owner_id,))
         return [{**dict(row), "enabled": bool(row["enabled"])} for row in rows]
 
     def save_skill(
-        self, owner_id: str, name: str, trigger: str, instructions: str, enabled: bool, skill_id: str | None = None,
+        self, owner_id: str, document: SkillDocument, enabled: bool,
+        *, skill_id: str | None = None, files: dict[str, str] | None = None,
     ) -> str | None:
-        trigger_key = unicodedata.normalize("NFKC", trigger).casefold()
         with self.db:
-            if skill_id is None:
-                skill_id = uuid4().hex
-                self.db.execute("""
-                    INSERT INTO skills (id, owner_id, name, trigger, trigger_key, instructions, enabled)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (skill_id, owner_id, name, trigger, trigger_key, instructions, enabled))
-            elif not self.db.execute("""
-                UPDATE skills SET name=?, trigger=?, trigger_key=?, instructions=?, enabled=?
-                WHERE id=? AND owner_id=?
-            """, (name, trigger, trigger_key, instructions, enabled, skill_id, owner_id)).rowcount:
-                return None
-        return skill_id
+            if skill_id is not None:
+                updated = self.db.execute("""
+                    UPDATE agent_skills SET name=?, description=?, document=?, enabled=?
+                    WHERE id=? AND owner_id=?
+                """, (document.name, document.description, document.source, enabled, skill_id, owner_id))
+                return skill_id if updated.rowcount else None
+            skill_id = uuid4().hex
+            self.db.execute("""
+                INSERT INTO agent_skills (id, owner_id, name, description, document, enabled, files)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (skill_id, owner_id, document.name, document.description, document.source, enabled, json.dumps(files or {})))
+            return skill_id
 
-    def matching_skill(self, owner_id: str, text: str) -> dict | None:
-        query = unicodedata.normalize("NFKC", text).casefold()
+    def set_skill_enabled(self, owner_id: str, skill_id: str, enabled: bool) -> bool:
+        with self.db:
+            return bool(self.db.execute(
+                "UPDATE agent_skills SET enabled=? WHERE id=? AND owner_id=?", (enabled, skill_id, owner_id),
+            ).rowcount)
+
+    def skill(self, owner_id: str, *, skill_id: str | None = None, name: str | None = None) -> dict | None:
         row = self.db.execute("""
-            SELECT name, instructions FROM skills WHERE owner_id=? AND enabled=1 AND instr(?, trigger_key)>0
-            ORDER BY length(trigger_key) DESC, id LIMIT 1
-        """, (owner_id, query)).fetchone()
-        return dict(row) if row else None
+            SELECT id, name, description, document, files, enabled FROM agent_skills
+            WHERE owner_id=? AND (id=? OR (name=? AND enabled=1))
+        """, (owner_id, skill_id, name)).fetchone()
+        return {**dict(row), "files": json.loads(row["files"]), "enabled": bool(row["enabled"])} if row else None

@@ -1,4 +1,4 @@
-"""Recognize account-level output preferences in the current user's words."""
+"""Select display preferences and interpret one-time presentation requests."""
 
 import re
 import unicodedata
@@ -11,13 +11,9 @@ _SCOPE = re.compile(
     r"|(?P<temporary>这次|此次|本次|本轮|这轮|这一轮|这回|这批|下次|下一次|下一轮)"
     r"|(?P<durable>从今以后|从现在开始|从下次开始|以后|今后|往后|未来都|每次|长期偏好|默认|记住)"
 )
-_NO_SAVE = re.compile(r"(?:别|不要|不用|无需|不必)[^。；，,]{0,12}(?:记住|保存|记录|设为默认|作为默认)")
-_READ_BACK = re.compile(
-    r"^(?:请问\s*)?(?:我之前|我以前|我上次|查看|查询|你记得|你还记得|你能否查|如何|为什么|(?:请|能否|能不能)?举)"
-)
 _DEFAULT_SUFFIX = re.compile(r"(?:设为|设成|作为|改为)(?:我的)?默认(?:设置|格式|偏好)?\s*$")
-_PRECISE = re.compile(r"(?<![0-9零〇一二两三四五六七八九十百])([012零〇一二两])\s*位(?:\s*小数|(?=\s*(?:[,，]|$)))")
-_NUMBERS = {"0": 0, "零": 0, "〇": 0, "1": 1, "一": 1, "2": 2, "二": 2, "两": 2}
+_PRECISE = re.compile(r"(?<![0-9零〇一二两三四五六七八九十百])([0123零〇一二两三])\s*位(?:\s*小数|(?=\s*(?:[,，]|$)))")
+_NUMBERS = {"0": 0, "零": 0, "〇": 0, "1": 1, "一": 1, "2": 2, "二": 2, "两": 2, "3": 3, "三": 3}
 _FILE_ORDER = re.compile(
     r"(?:按照?|保持|保留|沿用|使用|用)\s*(?:fasta\s*)?"
     r"(?:原始(?:文件|记录)?|原(?:文件|记录)?|文件(?:中的?)?(?:记录)?|输入(?:文件|记录)?|上传(?:文件)?|fasta)"
@@ -60,41 +56,12 @@ def _changes_in(text: str, *, gc_topic: bool) -> dict[str, str | int]:
     return updates
 
 
-def remembered_output_preferences(text: str) -> dict[str, str | int]:
-    """Extract only supported changes with an explicit lasting scope."""
-    text = unicodedata.normalize("NFKC", text)
-    if _READ_BACK.search(text.lstrip()):
-        return {}
-
-    updates: dict[str, str | int] = {}
-    for sentence in re.split(r"[。；;！？!?\n\r]+", text):
-        if _NO_SAVE.search(sentence):
-            continue
-        scopes = list(_SCOPE.finditer(sentence))
-        if not scopes:
-            continue
-
-        gc_topic = bool(_GC.search(sentence))
-        if _DEFAULT_SUFFIX.search(sentence) and all(match.lastgroup == "durable" for match in scopes):
-            updates.update(_changes_in(sentence, gc_topic=gc_topic))
-
-        for index, scope in enumerate(scopes):
-            if scope.lastgroup == "example":
-                break
-            if scope.lastgroup != "durable":
-                continue
-            end = scopes[index + 1].start() if index + 1 < len(scopes) else len(sentence)
-            updates.update(_changes_in(sentence[scope.end():end], gc_topic=gc_topic))
-
-    return updates
-
-
-def requested_gc_decimals(text: str) -> int | None:
-    """Read the display precision for the current request."""
+def temporary_output_preferences(text: str, *, gc: bool) -> dict[str, str | int]:
+    """Read the presentation choices intended for this request only."""
     text = unicodedata.normalize("NFKC", text)
     if re.match(r"^(?:请|能否|能不能)?举", text.lstrip()):
-        return None
-    decimals = None
+        return {}
+    overrides: dict[str, str | int] = {}
     for sentence in re.split(r"[。；;！？!?\n\r]+", text):
         if _DEFAULT_SUFFIX.search(sentence):
             continue
@@ -107,9 +74,22 @@ def requested_gc_decimals(text: str) -> int | None:
                 end = scopes[index + 1].start() if index + 1 < len(scopes) else len(sentence)
                 current_parts.append(sentence[scope.end():end])
         for part in current_parts:
-            if (places := _gc_decimals_in(part)) is not None:
-                decimals = places
-    return decimals
+            overrides.update(_changes_in(part, gc_topic=gc))
+    return overrides
+
+
+def effective_output_preferences(defaults: dict, text: str, analysis_type: str) -> dict:
+    """Resolve applicable output choices when a built-in analysis is submitted."""
+    if analysis_type not in ("seq_stats", "find_orf"):
+        return {}
+    gc = analysis_type == "seq_stats"
+    overrides = temporary_output_preferences(text, gc=gc)
+    order = overrides.get(RESULT_ORDER, defaults.get(RESULT_ORDER)) or "file"
+    decimals = overrides.get(GC_DECIMALS, defaults.get(GC_DECIMALS))
+    result = {RESULT_ORDER: order}
+    if gc:
+        result[GC_DECIMALS] = 2 if decimals is None else decimals
+    return result
 
 
 def relevant_output_preferences(

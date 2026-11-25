@@ -1,14 +1,16 @@
 """Short SQLite transactions on the application event loop."""
 
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path, PurePath
 import json
 import sqlite3
 from uuid import uuid4
 
-from .config import SAMPLES
+from .config import ANALYSES, CUSTOM_ANALYSIS, SAMPLES, TASK_TYPE_PATTERN, normalize_task_type
 from .context import HistoryTurn
 from .failures import Failure
+from .preferences import GC_DECIMALS, RESULT_ORDER, effective_output_preferences
 
 
 def now() -> str:
@@ -21,7 +23,7 @@ CREATE TABLE IF NOT EXISTS {table} (
     conversation_id TEXT NOT NULL REFERENCES conversations(id),
     origin_message_id INTEGER NOT NULL REFERENCES messages(id),
     file_id TEXT NOT NULL REFERENCES files(id),
-    analysis_type TEXT NOT NULL CHECK(analysis_type IN ('seq_stats', 'find_orf')),
+    analysis_type TEXT NOT NULL CHECK(analysis_type IN ('seq_stats', 'find_orf', 'custom_python')),
     state TEXT NOT NULL DEFAULT 'queued',
     created_at TEXT NOT NULL,
     started_at TEXT,
@@ -39,7 +41,11 @@ CREATE TABLE IF NOT EXISTS {table} (
     attempt_number INTEGER NOT NULL DEFAULT 1,
     retry_kind TEXT CHECK(retry_kind IN ('manual', 'automatic')),
     automatic_retries INTEGER NOT NULL DEFAULT 0,
-    available_at TEXT
+    available_at TEXT,
+    script_id TEXT REFERENCES analysis_scripts(id),
+    output_result_order TEXT CHECK(output_result_order IN ('file', 'sequence_id')),
+    output_gc_decimal_places INTEGER CHECK(output_gc_decimal_places BETWEEN 0 AND 3),
+    CHECK ((analysis_type='custom_python') = (script_id IS NOT NULL))
 );
 """
 
@@ -83,6 +89,17 @@ CREATE TABLE IF NOT EXISTS files (
     created_at TEXT,
     UNIQUE(conversation_id, name_key)
 );
+CREATE TABLE IF NOT EXISTS analysis_scripts (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL REFERENCES users(id),
+    display_name TEXT NOT NULL,
+    task_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    source BLOB NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS analysis_scripts_owner ON analysis_scripts(owner_id, created_at);
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES conversations(id),
@@ -114,21 +131,25 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
 """ + JOB_TABLE.format(table="jobs")
 
 INPUT_REQUEST_TABLE = """
-CREATE TABLE IF NOT EXISTS input_requests (
+CREATE TABLE IF NOT EXISTS {table} (
     id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES conversations(id),
     origin_message_id INTEGER NOT NULL REFERENCES messages(id),
-    analysis_type TEXT NOT NULL CHECK(analysis_type IN ('seq_stats', 'find_orf')),
+    analysis_type TEXT NOT NULL CHECK(analysis_type IN ('seq_stats', 'find_orf', 'custom_python')),
+    script_id TEXT REFERENCES analysis_scripts(id),
     filename TEXT NOT NULL,
     failed_job_id TEXT UNIQUE REFERENCES jobs(id),
     resolved_job_id TEXT REFERENCES jobs(id),
+    reminder_message_id INTEGER REFERENCES messages(id),
     created_at TEXT NOT NULL,
-    revision INTEGER NOT NULL DEFAULT 0
+    revision INTEGER NOT NULL DEFAULT 0,
+    CHECK ((analysis_type='custom_python') = (script_id IS NOT NULL))
 )
 """
 
 JOB_SELECT = """
 SELECT j.*, COALESCE(j.input_name, f.display_name) AS filename, c.owner_id,
+       script.display_name AS script_name, script.sha256 AS script_sha256, script.task_type,
        request.id AS input_request_id, next.id AS next_attempt_id, next.available_at AS next_attempt_at,
        COALESCE(j.finished_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) AS status_at,
        MAX(0, ROUND((julianday(COALESCE(j.started_at, j.finished_at, 'now')) - julianday(j.created_at)) * 86400, 3))
@@ -138,15 +159,17 @@ SELECT j.*, COALESCE(j.input_name, f.display_name) AS filename, c.owner_id,
 FROM jobs j
 JOIN files f ON f.id = j.file_id
 JOIN conversations c ON c.id = j.conversation_id
+LEFT JOIN analysis_scripts script ON script.id = j.script_id
 LEFT JOIN input_requests request ON request.failed_job_id = j.id
 LEFT JOIN jobs next ON next.retry_of_job_id = j.id
 """
 
 INPUT_REQUEST_SELECT = """
-SELECT request.*, failed.file_id AS original_file_id, failed.failure_code
+SELECT request.*, failed.file_id AS original_file_id, failed.failure_code, script.task_type
 FROM input_requests request
 JOIN conversations c ON c.id = request.conversation_id
 LEFT JOIN jobs failed ON failed.id = request.failed_job_id
+LEFT JOIN analysis_scripts script ON script.id = request.script_id
 """
 
 
@@ -155,7 +178,14 @@ class Store:
         self.db = sqlite3.connect(db_path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
-        self._upgrade()
+        rebuild_jobs = "script_id" not in {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}
+        if rebuild_jobs:
+            self.db.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self._upgrade(rebuild_jobs)
+        finally:
+            if rebuild_jobs:
+                self.db.execute("PRAGMA foreign_keys=ON")
         with self.db:
             for name in SAMPLES:
                 self.db.execute(
@@ -168,7 +198,7 @@ class Store:
     def close(self) -> None:
         self.db.close()
 
-    def _upgrade(self) -> None:
+    def _upgrade(self, rebuild_jobs: bool) -> None:
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             for table, name, declaration in (
@@ -176,11 +206,15 @@ class Store:
                 ("files", "owner_id", "TEXT REFERENCES users(id)"),
                 ("files", "created_at", "TEXT"),
                 ("jobs", "input_name", "TEXT"),
+                ("jobs", "output_result_order", "TEXT CHECK(output_result_order IN ('file', 'sequence_id'))"),
+                ("jobs", "output_gc_decimal_places", "INTEGER CHECK(output_gc_decimal_places BETWEEN 0 AND 3)"),
+                ("analysis_scripts", "task_type", "TEXT"),
             ):
                 columns = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})")}
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
-            self._upgrade_jobs()
+            self._upgrade_scripts()
+            self._upgrade_jobs(rebuild_jobs)
             self.db.execute("CREATE INDEX IF NOT EXISTS conversations_owner ON conversations(owner_id, updated_at)")
             self.db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS files_owner_name ON files(owner_id, name_key) WHERE owner_id IS NOT NULL"
@@ -189,26 +223,49 @@ class Store:
                 UPDATE jobs SET input_name=(SELECT display_name FROM files WHERE id=jobs.file_id)
                 WHERE input_name IS NULL
             """)
+            if rebuild_jobs and self.db.execute("PRAGMA foreign_key_check").fetchone():
+                raise sqlite3.IntegrityError("The job migration failed its foreign key check.")
 
-    def _upgrade_jobs(self) -> None:
-        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}
-        if "retry_of_job_id" not in columns:
-            old_fields = ("id, conversation_id, origin_message_id, file_id, analysis_type, state, created_at, "
-                          "started_at, finished_at, exit_code, runner_error, summary_state, revision, input_name")
+    def _upgrade_scripts(self) -> None:
+        for row in self._all("SELECT id, display_name FROM analysis_scripts WHERE task_type IS NULL"):
+            task_type = normalize_task_type(PurePath(row["display_name"]).stem)
+            if task_type in (*ANALYSES, CUSTOM_ANALYSIS) or not TASK_TYPE_PATTERN.fullmatch(task_type):
+                task_type = "python_" + row["id"][:12]
+            self.db.execute("UPDATE analysis_scripts SET task_type=? WHERE id=?", (task_type, row["id"]))
+        self.db.execute("""
+            CREATE INDEX IF NOT EXISTS analysis_scripts_type ON analysis_scripts(owner_id, task_type, created_at)
+        """)
+
+    def _upgrade_jobs(self, rebuild_jobs: bool) -> None:
+        if rebuild_jobs:
+            columns = {row["name"] for row in self.db.execute("PRAGMA table_info(jobs)")}
             self.db.execute(JOB_TABLE.format(table="jobs_upgrade"))
+            old_fields = ", ".join(row["name"] for row in self.db.execute("PRAGMA table_info(jobs_upgrade)")
+                                   if row["name"] in columns)
             self.db.execute(f"INSERT INTO jobs_upgrade ({old_fields}) SELECT {old_fields} FROM jobs")
             self.db.execute("DROP TABLE jobs")
             self.db.execute("ALTER TABLE jobs_upgrade RENAME TO jobs")
         self.db.execute("CREATE INDEX IF NOT EXISTS jobs_conversation ON jobs(conversation_id, created_at)")
+        self.db.execute("DROP INDEX IF EXISTS jobs_initial_submission")
         self.db.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS jobs_initial_submission ON jobs(origin_message_id, file_id, analysis_type)
+            CREATE UNIQUE INDEX IF NOT EXISTS jobs_initial_script
+            ON jobs(origin_message_id, file_id, analysis_type, COALESCE(script_id, ''))
             WHERE retry_of_job_id IS NULL
         """)
         self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS job_next_attempt ON jobs(retry_of_job_id)")
-        self.db.execute(INPUT_REQUEST_TABLE)
+        self.db.execute(INPUT_REQUEST_TABLE.format(table="input_requests"))
+        input_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(input_requests)")}
+        if "script_id" not in input_columns:
+            self.db.execute(INPUT_REQUEST_TABLE.format(table="input_requests_upgrade"))
+            fields = ", ".join(row["name"] for row in self.db.execute("PRAGMA table_info(input_requests_upgrade)")
+                               if row["name"] in input_columns)
+            self.db.execute(f"INSERT INTO input_requests_upgrade ({fields}) SELECT {fields} FROM input_requests")
+            self.db.execute("DROP TABLE input_requests")
+            self.db.execute("ALTER TABLE input_requests_upgrade RENAME TO input_requests")
         self.db.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS input_request_missing_name
-            ON input_requests(origin_message_id, analysis_type, filename) WHERE failed_job_id IS NULL
+            CREATE UNIQUE INDEX IF NOT EXISTS input_request_missing_script
+            ON input_requests(origin_message_id, analysis_type, filename, COALESCE(script_id, ''))
+            WHERE failed_job_id IS NULL
         """)
         self.db.execute("CREATE INDEX IF NOT EXISTS input_requests_conversation ON input_requests(conversation_id)")
 
@@ -238,17 +295,15 @@ class Store:
         ) or {"result_order": None, "gc_decimal_places": None}
 
     def save_output_preferences(
-        self, owner_id: str, order: str | None, decimals: int | None, *, keep_unspecified: bool = False,
+        self, owner_id: str, order: str | None, decimals: int | None, *, fields: set[str] | None = None,
     ) -> dict:
         with self.db:
             self.db.execute(
                 """INSERT INTO account_output_preferences (owner_id, result_order, gc_decimal_places)
                    VALUES (?, ?, ?) ON CONFLICT(owner_id) DO UPDATE
-                   SET result_order=CASE WHEN ? THEN COALESCE(excluded.result_order, result_order)
-                                         ELSE excluded.result_order END,
-                       gc_decimal_places=CASE WHEN ? THEN COALESCE(excluded.gc_decimal_places, gc_decimal_places)
-                                              ELSE excluded.gc_decimal_places END""",
-                (owner_id, order, decimals, keep_unspecified, keep_unspecified),
+                   SET result_order=CASE WHEN ? THEN excluded.result_order ELSE result_order END,
+                       gc_decimal_places=CASE WHEN ? THEN excluded.gc_decimal_places ELSE gc_decimal_places END""",
+                (owner_id, order, decimals, fields is None or RESULT_ORDER in fields, fields is None or GC_DECIMALS in fields),
             )
         return self.output_preferences(owner_id)
 
@@ -295,6 +350,9 @@ class Store:
                 FROM jobs GROUP BY conversation_id
             ) a ON a.conversation_id = c.id
             WHERE c.owner_id=?
+              AND (EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id=c.id)
+                   OR EXISTS (SELECT 1 FROM files f WHERE f.conversation_id=c.id)
+                   OR a.conversation_id IS NOT NULL)
             ORDER BY c.updated_at DESC
         """, (owner_id,))
 
@@ -325,6 +383,38 @@ class Store:
             (file_id, conversation_id, name, name.casefold(), file_id, size, owner_id, now()),
         )
 
+    def analysis_scripts(self, owner_id: str) -> list[dict]:
+        return self._all("""
+            SELECT id, display_name, task_type, size_bytes, sha256, created_at
+            FROM analysis_scripts WHERE owner_id=? ORDER BY created_at DESC, id
+        """, (owner_id,))
+
+    def registered_analysis_types(self, owner_id: str) -> list[str]:
+        rows = self._all("SELECT DISTINCT task_type FROM analysis_scripts WHERE owner_id=? ORDER BY task_type",
+                         (owner_id,))
+        return [row["task_type"] for row in rows]
+
+    def latest_analysis_script_id(self, owner_id: str, task_type: str) -> str | None:
+        row = self._one("""
+            SELECT id FROM analysis_scripts WHERE owner_id=? AND task_type=?
+            ORDER BY created_at DESC, id LIMIT 1
+        """, (owner_id, task_type))
+        return row["id"] if row else None
+
+    def add_analysis_script(self, owner_id: str, name: str, task_type: str, source: bytes) -> dict:
+        script = {"id": uuid4().hex, "display_name": name, "task_type": task_type, "size_bytes": len(source),
+                  "sha256": sha256(source).hexdigest(), "created_at": now()}
+        with self.db:
+            self.db.execute("""
+                INSERT INTO analysis_scripts (id, owner_id, display_name, task_type, size_bytes, sha256, source, created_at)
+                VALUES (:id, :owner_id, :display_name, :task_type, :size_bytes, :sha256, :source, :created_at)
+            """, {**script, "owner_id": owner_id, "source": source})
+        return script
+
+    def analysis_script_source(self, owner_id: str, script_id: str) -> bytes | None:
+        row = self._one("SELECT source FROM analysis_scripts WHERE owner_id=? AND id=?", (owner_id, script_id))
+        return row["source"] if row else None
+
     @staticmethod
     def public_file(row: dict) -> dict:
         return {key: row[key] for key in ("id", "display_name", "source", "size_bytes", "created_at")}
@@ -338,28 +428,64 @@ class Store:
 
     def user_message(self, conversation_id: str, client_id: str, text: str) -> tuple[dict, bool]:
         with self.db:
-            cursor = self.db.execute(
-                """INSERT INTO messages
-                   (conversation_id, kind, status, content, client_message_id, created_at)
-                   VALUES (?, 'user', 'queued', ?, ?, ?)
-                   ON CONFLICT(conversation_id, client_message_id) DO NOTHING""",
-                (conversation_id, text, client_id, now()),
+            return self._insert_user_message(conversation_id, client_id, text, "queued")
+
+    def _insert_user_message(self, conversation_id: str, client_id: str, text: str, status: str) -> tuple[dict, bool]:
+        cursor = self.db.execute(
+            """INSERT INTO messages
+               (conversation_id, kind, status, content, client_message_id, created_at)
+               VALUES (?, 'user', ?, ?, ?, ?)
+               ON CONFLICT(conversation_id, client_message_id) DO NOTHING""",
+            (conversation_id, status, text, client_id, now()),
+        )
+        if not cursor.rowcount:
+            row = self._one(
+                "SELECT * FROM messages WHERE conversation_id=? AND client_message_id=?",
+                (conversation_id, client_id),
             )
-            if not cursor.rowcount:
-                row = self._one(
-                    "SELECT * FROM messages WHERE conversation_id=? AND client_message_id=?",
-                    (conversation_id, client_id),
-                )
-                return self.public_message(row), False
-            title = " ".join(text.split())[:48]
-            self.db.execute(
-                """UPDATE conversations SET updated_at=?,
-                   title=CASE WHEN (SELECT COUNT(*) FROM messages
-                                    WHERE conversation_id=? AND kind='user') = 1
-                         THEN ? ELSE title END WHERE id=?""",
-                (now(), conversation_id, title, conversation_id),
-            )
+            return self.public_message(row), False
+        title = " ".join(text.split())[:48]
+        self.db.execute(
+            """UPDATE conversations SET updated_at=?,
+               title=CASE WHEN (SELECT COUNT(*) FROM messages
+                                WHERE conversation_id=? AND kind='user') = 1
+                     THEN ? ELSE title END WHERE id=?""",
+            (now(), conversation_id, title, conversation_id),
+        )
+        self._record_input_reminder(conversation_id, cursor.lastrowid)
         return self.message(cursor.lastrowid), True
+
+    def _record_input_reminder(self, conversation_id: str, turn_id: int) -> None:
+        pending = self._all("""
+            SELECT filename, failed_job_id FROM input_requests
+            WHERE conversation_id=? AND resolved_job_id IS NULL AND reminder_message_id IS NULL
+            ORDER BY created_at, id
+        """, (conversation_id,))
+        if not pending:
+            return
+
+        failed = "、".join(dict.fromkeys(f"「{item['filename']}」" for item in pending if item["failed_job_id"]))
+        missing = "、".join(dict.fromkeys(f"「{item['filename']}」" for item in pending if not item["failed_job_id"]))
+        notices = []
+        if failed:
+            notices.append(f"先前的 {failed} 分析失败，尚未补充修正版，暂未重新运行。")
+        if missing:
+            notices.append(f"{missing} 仍待补充，分析暂未开始。")
+        reminder = self.db.execute("""
+            INSERT INTO messages (conversation_id, turn_id, kind, status, content, source, created_at)
+            VALUES (?, ?, 'input_reminder', 'done', ?, 'system', ?)
+        """, (conversation_id, turn_id, "\n".join(notices), now()))
+        self.db.execute("""
+            UPDATE input_requests SET reminder_message_id=?, revision=revision+1
+            WHERE conversation_id=? AND resolved_job_id IS NULL AND reminder_message_id IS NULL
+        """, (reminder.lastrowid, conversation_id))
+
+    def input_reminder(self, conversation_id: str, turn_id: int) -> dict | None:
+        row = self._one(
+            "SELECT * FROM messages WHERE conversation_id=? AND COALESCE(turn_id, id)=? AND kind='input_reminder'",
+            (conversation_id, turn_id),
+        )
+        return self.public_message(row) if row else None
 
     def add_message(
         self,
@@ -416,6 +542,18 @@ class Store:
                 (conversation_id, turn_id, job_id),
             ).fetchall()
         return [self.message(row["id"]) for row in rows]
+
+    def activated_skill_ids(self, conversation_id: str, turn_id: int) -> list[str]:
+        rows = self._all("""
+            SELECT json_extract(m.content, '$.skill_id') AS skill_id
+            FROM messages m JOIN messages i ON i.id=m.invocation_id
+            JOIN json_each(i.tool_calls) c ON json_extract(c.value, '$.id')=m.tool_call_id
+            WHERE m.conversation_id=? AND m.turn_id=? AND m.kind='tool' AND m.job_id IS NULL
+            AND json_extract(c.value, '$.function.name')='activate_skill'
+            AND json_extract(m.content, '$.ok')=1
+            ORDER BY m.id
+        """, (conversation_id, turn_id))
+        return list(dict.fromkeys(row["skill_id"] for row in rows if row["skill_id"]))
 
     def history_turns(
         self, conversation_id: str, *, before: int, after: int, limit: int,
@@ -510,23 +648,36 @@ class Store:
             JOB_SELECT + " WHERE j.conversation_id=? AND j.id LIKE ? LIMIT 2", (conversation_id, prefix + "%")
         )
 
-    def submit(self, conversation_id: str, turn_id: int, file_id: str, analysis_type: str) -> tuple[dict, bool]:
+    def submit(
+        self, conversation_id: str, turn_id: int, file_id: str, analysis_type: str, *, script_id: str | None = None,
+    ) -> tuple[dict, bool]:
         with self.db:
-            return self._submit(conversation_id, turn_id, file_id, analysis_type)
+            self.db.execute("BEGIN IMMEDIATE")
+            return self._submit(conversation_id, turn_id, file_id, analysis_type, script_id=script_id)
 
-    def _submit(self, conversation_id: str, turn_id: int, file_id: str, analysis_type: str) -> tuple[dict, bool]:
+    def _submit(
+        self, conversation_id: str, turn_id: int, file_id: str, analysis_type: str, *, script_id: str | None = None,
+    ) -> tuple[dict, bool]:
         job_id = uuid4().hex
+        preferences = {}
+        if analysis_type in ANALYSES:
+            conversation = self._one("SELECT owner_id FROM conversations WHERE id=?", (conversation_id,))
+            defaults = self.output_preferences(conversation["owner_id"])
+            preferences = effective_output_preferences(defaults, self.message(turn_id)["content"], analysis_type)
         cursor = self.db.execute(
-            """INSERT INTO jobs (id, conversation_id, origin_message_id, file_id, analysis_type, created_at, input_name)
-               VALUES (?, ?, ?, ?, ?, ?, (SELECT display_name FROM files WHERE id=?))
-               ON CONFLICT(origin_message_id, file_id, analysis_type) WHERE retry_of_job_id IS NULL DO NOTHING""",
-            (job_id, conversation_id, turn_id, file_id, analysis_type, now(), file_id),
+            """INSERT INTO jobs (id, conversation_id, origin_message_id, file_id, analysis_type, created_at,
+                                 input_name, script_id, output_result_order, output_gc_decimal_places)
+               VALUES (?, ?, ?, ?, ?, ?, (SELECT display_name FROM files WHERE id=?), ?, ?, ?)
+               ON CONFLICT DO NOTHING""",
+            (job_id, conversation_id, turn_id, file_id, analysis_type, now(), file_id, script_id,
+             preferences.get(RESULT_ORDER), preferences.get(GC_DECIMALS)),
         )
         if cursor.rowcount:
             return self.job(job_id), True
         row = self._one(JOB_SELECT + """
-            WHERE j.origin_message_id=? AND j.file_id=? AND j.analysis_type=? AND j.retry_of_job_id IS NULL
-        """, (turn_id, file_id, analysis_type))
+            WHERE j.origin_message_id=? AND j.file_id=? AND j.analysis_type=? AND j.script_id IS ?
+            AND j.retry_of_job_id IS NULL
+        """, (turn_id, file_id, analysis_type, script_id))
         return row, False
 
     def retry_job(self, job: dict) -> tuple[dict, bool]:
@@ -541,11 +692,13 @@ class Store:
         job_id = uuid4().hex
         self.db.execute(
             """INSERT INTO jobs (id, conversation_id, origin_message_id, file_id, analysis_type, created_at, input_name,
-                                 retry_of_job_id, root_job_id, attempt_number, retry_kind, automatic_retries, available_at)
-               VALUES (?, ?, ?, ?, ?, ?, (SELECT display_name FROM files WHERE id=?), ?, ?, ?, ?, ?, ?)""",
+                                 retry_of_job_id, root_job_id, attempt_number, retry_kind, automatic_retries,
+                                 available_at, script_id, output_result_order, output_gc_decimal_places)
+               VALUES (?, ?, ?, ?, ?, ?, (SELECT display_name FROM files WHERE id=?), ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, job["conversation_id"], job["origin_message_id"], file_id, job["analysis_type"], now(), file_id,
              job["id"], job["root_job_id"] or job["id"], job["attempt_number"] + 1,
-             "automatic" if retry_at else "manual", job["automatic_retries"] + 1 if retry_at else 0, retry_at),
+             "automatic" if retry_at else "manual", job["automatic_retries"] + 1 if retry_at else 0, retry_at, job["script_id"],
+             job["output_result_order"], job["output_gc_decimal_places"]),
         )
         self.db.execute("UPDATE jobs SET revision=revision+1 WHERE id=?", (job["id"],))
         return self.job(job_id), True
@@ -553,23 +706,28 @@ class Store:
     def queued_jobs(self) -> list[dict]:
         return self._all(JOB_SELECT + " WHERE j.state='queued' AND c.owner_id IS NOT NULL ORDER BY j.created_at")
 
-    def request_input(self, conversation_id: str, turn_id: int, analysis_type: str, filename: str) -> tuple[dict, bool]:
+    def request_input(
+        self, conversation_id: str, turn_id: int, analysis_type: str, filename: str, *, script_id: str | None = None,
+    ) -> tuple[dict, bool]:
         with self.db:
-            return self._request_input(conversation_id, turn_id, analysis_type, filename)
+            return self._request_input(conversation_id, turn_id, analysis_type, filename, script_id=script_id)
 
     def _request_input(
         self, conversation_id: str, turn_id: int, analysis_type: str, filename: str, failed_job_id: str | None = None,
+        *, script_id: str | None = None,
     ) -> tuple[dict, bool]:
         request_id = uuid4().hex
         cursor = self.db.execute("""
-            INSERT INTO input_requests (id, conversation_id, origin_message_id, analysis_type, filename, failed_job_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
-        """, (request_id, conversation_id, turn_id, analysis_type, filename, failed_job_id, now()))
+            INSERT INTO input_requests (id, conversation_id, origin_message_id, analysis_type, filename, failed_job_id,
+                                        created_at, script_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
+        """, (request_id, conversation_id, turn_id, analysis_type, filename, failed_job_id, now(), script_id))
         if cursor.rowcount:
             return self.input_request(request_id), True
         row = self._one(INPUT_REQUEST_SELECT + """
             WHERE request.origin_message_id=? AND request.analysis_type=? AND request.filename=? AND request.failed_job_id IS ?
-        """, (turn_id, analysis_type, filename, failed_job_id))
+            AND request.script_id IS ?
+        """, (turn_id, analysis_type, filename, failed_job_id, script_id))
         return row, False
 
     def input_request(self, request_id: str) -> dict | None:
@@ -593,7 +751,7 @@ class Store:
                 job, created = self._retry(self.job(request["failed_job_id"]), file_id)
             else:
                 job, created = self._submit(request["conversation_id"], request["origin_message_id"],
-                                            file_id, request["analysis_type"])
+                                            file_id, request["analysis_type"], script_id=request["script_id"])
             self.db.execute("UPDATE input_requests SET resolved_job_id=?, revision=revision+1 WHERE id=?",
                             (job["id"], request_id))
             return self.input_request(request_id), job, created
@@ -629,7 +787,7 @@ class Store:
                     self._retry(job, job["file_id"], retry_at)
                 else:
                     self._request_input(job["conversation_id"], job["origin_message_id"], job["analysis_type"],
-                                        job["filename"], job_id)
+                                        job["filename"], job_id, script_id=job["script_id"])
         return self.job(job_id)
 
     def change_summary(self, job_id: str, before: str, after: str) -> dict | None:

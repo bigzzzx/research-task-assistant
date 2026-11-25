@@ -17,7 +17,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .agent import Agent
 from .auth import Account, current_account, router as auth_router
-from .config import ROOT, SAMPLES, UPLOAD_LIMIT, Settings
+from .config import ANALYSES, CUSTOM_ANALYSIS, ROOT, SAMPLES, TASK_TYPE_PATTERN, UPLOAD_LIMIT, Settings, normalize_task_type
 from .events import Events
 from .extension_api import router as extension_router
 from .extensions import ExtensionStore
@@ -64,7 +64,7 @@ def create_app(
         jobs = Jobs(resolved, store, events, lambda job: agent.complete(job))
         try:
             extensions = ExtensionStore(store.db)
-            async with open_tool_client(Tools(store, jobs), extensions, resolved.mcp_http_endpoints) as tools:
+            async with open_tool_client(Tools(store, jobs), extensions, resolved) as tools:
                 agent = Agent(store, events, model, tools)
                 app.state.settings, app.state.events, app.state.store = resolved, events, store
                 app.state.agent, app.state.jobs, app.state.tools = agent, jobs, tools
@@ -116,8 +116,7 @@ def create_app(
     async def config(account: SignedIn):
         resolved = app.state.settings
         return {"model": resolved.model, "key_configured": bool(resolved.api_key),
-                "samples": list(SAMPLES), "upload_limit": UPLOAD_LIMIT,
-                "research_mcp_added": app.state.extensions.has_research_server(account.id)}
+                "samples": list(SAMPLES), "upload_limit": UPLOAD_LIMIT}
 
     @app.get("/api/preferences", response_model=OutputPreferences)
     async def output_preferences(account: SignedIn):
@@ -150,11 +149,15 @@ def create_app(
         text = body.text.strip()
         if not text:
             raise HTTPException(422, "请输入要发送的消息。")
-        message, created = app.state.store.user_message(conversation_id, body.client_message_id, text)
+        store = app.state.store
+        message, created = store.user_message(conversation_id, body.client_message_id, text)
+        reminder = store.input_reminder(conversation_id, message["id"])
         if created:
             app.state.events.send(account.id, "message.updated", message)
+            if reminder:
+                app.state.events.send(account.id, "message.updated", reminder)
             app.state.agent.chat(account.id, message)
-        return message
+        return {**message, "input_reminder": reminder} if reminder else message
 
     @app.get("/api/events")
     async def events(account: SignedIn):
@@ -182,6 +185,31 @@ def create_app(
     @app.post("/api/files", status_code=201)
     async def upload(filename: str, request: Request, account: SignedIn):
         return await save_upload(account, filename, request)
+
+    @app.get("/api/analysis-scripts")
+    async def analysis_scripts(account: SignedIn):
+        return app.state.store.analysis_scripts(account.id)
+
+    @app.post("/api/analysis-scripts", status_code=201)
+    async def upload_script(filename: str, task_type: str, request: Request, account: SignedIn):
+        name = validated_filename(filename, {".py"})
+        task_type = normalize_task_type(task_type)
+        if not TASK_TYPE_PATTERN.fullmatch(task_type):
+            raise HTTPException(422, "任务类型需为 1～64 个文字、数字、下划线或短横线。")
+        if task_type in (*ANALYSES, CUSTOM_ANALYSIS):
+            raise HTTPException(422, "该任务类型已由系统保留，请使用其他名称。")
+        source = bytearray()
+        async for part in request.stream():
+            if len(source) + len(part) > UPLOAD_LIMIT:
+                raise HTTPException(413, "脚本超过 5 MiB，请使用较小的 .py 文件。")
+            source.extend(part)
+        if not source.strip():
+            raise HTTPException(422, "脚本内容为空。")
+
+        store = app.state.store
+        if not store.session(account.token_hash):
+            raise HTTPException(401, "登录已失效，请重新登录后上传。")
+        return store.add_analysis_script(account.id, name, task_type, bytes(source))
 
     async def save_upload(account: Account, filename: str, request: Request, conversation_id: str | None = None):
         name = validated_filename(filename)
@@ -401,11 +429,12 @@ def create_app(
     return app
 
 
-def validated_filename(filename: str) -> str:
+def validated_filename(filename: str, suffixes: set[str] = SUFFIXES) -> str:
     name = unicodedata.normalize("NFC", filename.strip())
     if (not name or len(name) > 120 or not name.isprintable() or any(char in name for char in '/\\:<>|"?*')
-            or PurePath(name).suffix.lower() not in SUFFIXES):
-        raise HTTPException(422, "请使用长度不超过 120 字符的 .fasta、.fa 或 .fna 文件名。")
+            or PurePath(name).suffix.lower() not in suffixes):
+        allowed = "、".join(sorted(suffixes))
+        raise HTTPException(422, f"请使用长度不超过 120 字符的 {allowed} 文件名。")
     return name
 
 

@@ -5,4 +5,5 @@ httpx2==2.16.2
 jsonschema==4.26.0
 mcp==2.3.0
 python-dotenv==1.2.4
+PyYAML==6.0.4
 referencing==0.37.0
