@@ -154,6 +154,25 @@ flowchart LR
     Jobs --> Volume["持久卷 /app/var<br/>上传文件 · 标准输出 / 错误日志"]
 ```
 
+纯文本版（图片和 Mermaid 都加载不出来时看这一份）：
+
+```text
+React 浏览器
+   │  HTTP + SSE（消息增量 / 工具轨迹 / 任务状态）
+   ▼
+FastAPI ──> ReAct Agent <──流式调用──> DeepSeek API
+                │
+                ├──tools/call──> MCP Client ──stdio──> 科研 MCP Server
+                │                                      （submit_job / job_status / read_log）
+                │                                            │ 本机 IPC
+                │                                            ▼
+                │                                      任务管理器 ──> Python 子进程
+                │                                      （异步队列 / 状态 / 日志）（seq_stats · find_orf）
+                ▼
+        SQLite + 持久卷 /app/var
+        （账号、会话、任务记录、上传文件、stdout / stderr）
+```
+
 浏览器通过 HTTP 发出请求，通过 SSE 接收消息增量、工具轨迹和任务状态。FastAPI 里的 ReAct Agent 经 MCP Client 调用科研工具。`submit_job` 将任务交给后台队列，任务结束后助手查询状态、读取日志，再向原会话推送解释。SQLite 保存会话和任务记录，上传文件和完整日志保存在同一个持久卷的文件目录中。本机方式还可以由宿主机 Docker 运行自定义脚本。
 
 | 模块 | 职责 |
