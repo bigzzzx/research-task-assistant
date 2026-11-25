@@ -137,6 +137,23 @@ DEEPSEEK_INPUT_TOKEN_BUDGET=24000
 
 ![React 浏览器通过 HTTP 和 SSE 连接 FastAPI。ReAct Agent 请求 DeepSeek，经 MCP Client 和 stdio 调用科研工具。任务管理器启动 Python 子进程，数据库、上传文件和日志保存在持久卷。](docs/architecture.png)
 
+如果图片没有加载（GitHub 的 raw 域名在部分网络不可达），下面是同一架构的 Mermaid 版本，GitHub 会直接渲染：
+
+```mermaid
+flowchart LR
+    UI["React 浏览器"] -->|HTTP + SSE| API["FastAPI<br/>鉴权 · 静态资源 · SSE"]
+    API --> Agent["ReAct Agent<br/>上下文 · 工具选择 · 结果解释"]
+    Agent <-->|流式调用| Model["DeepSeek API"]
+    Agent <-->|tools/call| Client["MCP Client"]
+    Client <-->|stdio| Server["科研 MCP Server<br/>submit_job · job_status · read_log"]
+    Client <-->|HTTP / SSE| External["外部 MCP（可选）"]
+    Server -->|本机 IPC| Jobs["任务管理器<br/>异步队列 · 状态 · 日志"]
+    Jobs --> Python["Python 子进程<br/>seq_stats.py · find_orf.py"]
+    Jobs -->|任务终态| Agent
+    Agent --> DB[("SQLite<br/>账号 · 会话 · 任务记录")]
+    Jobs --> Volume["持久卷 /app/var<br/>上传文件 · 标准输出 / 错误日志"]
+```
+
 浏览器通过 HTTP 发出请求，通过 SSE 接收消息增量、工具轨迹和任务状态。FastAPI 里的 ReAct Agent 经 MCP Client 调用科研工具。`submit_job` 将任务交给后台队列，任务结束后助手查询状态、读取日志，再向原会话推送解释。SQLite 保存会话和任务记录，上传文件和完整日志保存在同一个持久卷的文件目录中。本机方式还可以由宿主机 Docker 运行自定义脚本。
 
 | 模块 | 职责 |
@@ -222,3 +239,5 @@ npm --prefix frontend run build
 - [排期、风险与录屏脚本](docs/04-三天排期与交付计划.md)
 
 提交用的演示录屏是 [`recordings/AI生成的演示视频.mp4`](recordings/AI生成的演示视频.mp4)（3 分 14 秒，真实模型与本机子进程，含 `sample3` 的失败处理）；分镜、字幕和重录命令见[录屏脚本](docs/demo-script.md)。
+
+补充材料是 [`recordings/演示视频讲解.mp4`](recordings/演示视频讲解.mp4)（8 分 19 秒，1920×1080 带语音的人工讲解版，覆盖完整操作流程），超出 3–5 分钟提交版时长，作为附加讲解提供。

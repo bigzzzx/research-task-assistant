@@ -18,7 +18,6 @@ frontend/*.tsbuildinfo
 
 # Demo recording scratch space
 recordings/raw/
-recordings/演示视频讲解.mp4
 demo-data/
 .testtmp/
 .npmcache/
