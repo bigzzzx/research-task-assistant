@@ -48,7 +48,27 @@ docker compose up --build
 
 - 数据保存在命名卷里（默认名 `<目录名>_app-data`），`docker compose down` 不删数据，`docker compose down -v` 清空重来。
 - 端口被占用时用 `APP_PORT=9000 docker compose up --build`，然后访问 <http://localhost:9000>。
+- Ubuntu 服务器上的服务同样绑定回环地址。在自己的电脑上执行 `ssh -N -L 8767:127.0.0.1:8767 ubuntu@你的服务器`，再打开 <http://localhost:8767>。
 - Compose 直接从同目录的 `.env` 读取变量注入容器，镜像里不包含 `.env`，Key 不会被打进镜像。
+
+如果服务器拉取 Docker Hub 镜像超时，可在 `.env` 中指定 Docker 在 ECR Public 发布的镜像，再执行同一条启动命令。[Node 镜像](https://gallery.ecr.aws/docker/library/node) · [Python 镜像](https://gallery.ecr.aws/docker/library/python)
+
+```dotenv
+NODE_BASE_IMAGE=public.ecr.aws/docker/library/node:22-alpine
+PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.12-slim
+```
+
+若 Python 依赖下载较慢，可在 `.env` 中将 `PYTHON_PACKAGE_INDEX` 设为可访问的索引。这台 Ubuntu 服务器实测使用了 `https://mirrors.cloud.tencent.com/pypi/simple`。[腾讯云软件源说明](https://cloud.tencent.com/document/product/213/8623)
+
+### Ubuntu 实机验证
+
+在 Ubuntu 24.04.4（Docker Engine 29.1.3、Compose 2.40.3）上执行 `docker compose up -d --build --wait`。前端构建使用服务器已缓存的 `NODE_BASE_IMAGE=node:24-alpine`，Python 运行镜像使用上面的 ECR Public 镜像，依赖索引使用腾讯云源；构建出的应用镜像约 58.7 MB。
+
+- 容器达到 `healthy`；首页和前端 JS/CSS 返回 HTTP 200，未登录的 `/api/config` 返回 401。
+- 注册账号返回 201；`/api/tools` 列出 `submit_job`、`job_status`、`read_log` 三个 MCP 工具；上传 FASTA 返回 201 并出现在文件列表。
+- 在容器内直接运行内置脚本：`sample1` 的 `seq1` 为 45 nt / 48.89%、`seq2` 为 47 nt / 61.70%；`sample2` 的 `gene_A` 为 6–83（78 nt）、`gene_B` 为 7–21（15 nt）；`sample3` 退出码 2，错误日志同时给出缺标题行和非法字符两处诊断。
+- `docker compose up -d --force-recreate --wait` 重建容器后，原登录会话、账号和上传文件仍可读取（数据在命名卷 `app-data`）。
+- 镜像内没有 `.env`；这轮使用空 Key 验证部署，容器环境变量里没有真实 Key。
 
 ### 方式二：本机运行（Python + Node）
 
@@ -113,28 +133,11 @@ DEEPSEEK_INPUT_TOKEN_BUDGET=24000
 4. **上传自己的文件再分析。** 点「上传 FASTA」添加 `.fa`/`.fasta`/`.fna` 文件，然后直接说“用 seq_stats 分析我上传的文件”。
 5. **刷新页面、切换会话。** 历史会话、工具卡片和任务日志都还在。
 
-## 架构
+## 整体架构
 
-```mermaid
-flowchart LR
-    UI["React 单页<br/>聊天 / 任务 / 文件 / 扩展"] -->|HTTP + SSE| API["FastAPI 单进程"]
-    API --> Agent["手写 ReAct 循环"]
-    Agent <-->|流式 tool_calls| Model["DeepSeek Chat Completions"]
-    Agent <-->|MCP tools/list·tools/call| Client["MCP Client"]
-    Client <-->|stdio| Server["本机科研 MCP Server"]
-    Server --> Tools["submit_job / job_status / read_log"]
-    Tools --> Jobs["任务管理器<br/>2 并发子进程"]
-    Jobs --> Py["seq_stats.py / find_orf.py<br/>独立进程，4s 模拟耗时"]
-    Jobs --> Docker["自定义脚本<br/>一次性容器"]
-    Jobs -->|终态事件| Agent
-    Jobs --> Logs["stdout / stderr"]
-    Agent --> DB[("SQLite")]
-    Jobs --> DB
-    Logs --> DB
-    API --> DB
-```
+![React 浏览器通过 HTTP 和 SSE 连接 FastAPI。ReAct Agent 请求 DeepSeek，经 MCP Client 和 stdio 调用科研工具。任务管理器启动 Python 子进程，数据库、上传文件和日志保存在持久卷。](docs/architecture.png)
 
-一段话说清：浏览器只和 FastAPI 通信，消息增量、工具轨迹和任务状态都走同一条 SSE 连接。FastAPI 进程里跑着手写的 ReAct 循环，它通过 MCP Client 以 stdio 连接本机的科研 MCP Server，Server 里是题目要求的三个工具。`submit_job` 把任务交给任务管理器，由后者启动 Python 子进程（自定义脚本则放进一次性 Docker 容器），两路日志写入 `var/`；任务结束或失败时，任务管理器按任务 ID 唤醒原会话的助手，助手再读状态和日志生成解释。账号、会话、消息、工具记录、文件和任务都存在 SQLite 里。
+浏览器通过 HTTP 发出请求，通过 SSE 接收消息增量、工具轨迹和任务状态。FastAPI 里的 ReAct Agent 经 MCP Client 调用科研工具。`submit_job` 将任务交给后台队列，任务结束后助手查询状态、读取日志，再向原会话推送解释。SQLite 保存会话和任务记录，上传文件和完整日志保存在同一个持久卷的文件目录中。本机方式还可以由宿主机 Docker 运行自定义脚本。
 
 | 模块 | 职责 |
 | --- | --- |
@@ -166,7 +169,8 @@ frontend/            React 前端（构建产物 dist/ 由后端托管）
 scripts/             两个分析脚本
 data/                sample1–3.fasta
 tests/               66 个用例
-docs/                需求分析、技术方案、验收基准、排期与录屏脚本
+docs/                需求分析、技术方案、验收基准、排期、架构图与录屏脚本
+recordings/          提交版录屏（3 分 14 秒）与人工讲解补充版
 Dockerfile           多阶段构建（Node 构建前端 → Python 运行后端）
 docker-compose.yml   一键启动
 requirements.txt     Python 依赖（全部固定版本）
@@ -207,9 +211,8 @@ npm --prefix frontend run build
 - 没做密码找回、账号删除、审计日志——本机单人使用，账号只解决“多个人用同一台机器时数据别串”。
 - 没做多模型路由、失败自动降级；模型不可用时只能人工重试解释。
 - 外部 MCP 只支持公开地址和部署者在 `.env` 登记的本机命令，没有 OAuth 授权流程；远程服务端需要自己保证鉴权。
-- 只在 Windows 11 上完整验证过；macOS/Linux 的路径和子进程逻辑按标准库写，但没有实机跑过。
+- 完整聊天链路已在 Windows 11 上用真实模型验收。Ubuntu 24.04 已通过上面的 Compose 启动和持久化检查。
 - Docker Compose 模式里跑不了自定义 Python 脚本（容器内没有 Docker CLI/守护进程）。
-- **Docker 验证说明（如实交代）**：开发这台的机器没有安装 Docker Desktop，因此没有在本机执行过完整镜像构建。已做的验证：用 Docker Compose v5.8 对 `docker-compose.yml` 执行 `config`（变量替换、卷、健康检查均通过），并在本机按镜像内相同步骤跑通 `npm ci` 锁文件校验、`npm run build`、`pip install -r requirements.txt`、`uvicorn` 启动与页面/接口访问。首次在你机器上执行 `docker compose up --build` 需要能拉取上述两个基础镜像。
 
 ## 文档与演示
 
@@ -218,4 +221,4 @@ npm --prefix frontend run build
 - [样例基准与验收用例](docs/03-样例基准与验收用例.md)
 - [排期、风险与录屏脚本](docs/04-三天排期与交付计划.md)
 
-演示录屏（3–5 分钟，含 `sample3` 的失败处理）在 [`recordings/demo.mp4`](recordings/demo.mp4)；对应的分镜和讲解词见[录屏脚本](docs/demo-script.md)。
+提交用的演示录屏是 [`recordings/AI生成的演示视频.mp4`](recordings/AI生成的演示视频.mp4)（3 分 14 秒，真实模型与本机子进程，含 `sample3` 的失败处理）；分镜、字幕和重录命令见[录屏脚本](docs/demo-script.md)。

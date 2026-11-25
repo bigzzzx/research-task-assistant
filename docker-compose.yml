@@ -5,12 +5,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: research-task-assistant:local
-    container_name: research-task-assistant
+      args:
+        NODE_BASE_IMAGE: ${NODE_BASE_IMAGE:-node:22-alpine}
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-python:3.12-slim}
+        PYTHON_PACKAGE_INDEX: ${PYTHON_PACKAGE_INDEX:-https://pypi.org/simple}
     init: true
     restart: unless-stopped
     ports:
-      - "${APP_PORT:-8767}:8767"
+      - "127.0.0.1:${APP_PORT:-8767}:8767"
     environment:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-flash}

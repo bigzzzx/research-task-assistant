@@ -1,7 +1,8 @@
-# syntax=docker/dockerfile:1
+ARG NODE_BASE_IMAGE=node:22-alpine
+ARG PYTHON_BASE_IMAGE=python:3.12-slim
 
 # 1) 用 Vite 构建前端静态资源
-FROM node:22-alpine AS web
+FROM ${NODE_BASE_IMAGE} AS web
 WORKDIR /web
 ENV npm_config_update_notifier=false npm_config_fund=false npm_config_audit=false
 COPY frontend/package.json frontend/package-lock.json ./
@@ -10,7 +11,8 @@ COPY frontend/ ./
 RUN npm run build
 
 # 2) 运行后端，并由同一个进程提供上一步构建的前端
-FROM python:3.12-slim
+FROM ${PYTHON_BASE_IMAGE}
+ARG PYTHON_PACKAGE_INDEX=https://pypi.org/simple
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONUTF8=1 \
@@ -20,7 +22,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 COPY requirements.txt ./
-RUN python -m pip install -r requirements.txt
+RUN python -m pip install --index-url "$PYTHON_PACKAGE_INDEX" -r requirements.txt
 
 COPY backend ./backend
 COPY scripts ./scripts

@@ -1,6 +1,6 @@
 # 演示录屏脚本（3–5 分钟）
 
-成片：`recordings/demo.mp4`。录制使用真实 DeepSeek 模型、真实本机子进程和真实 SQLite，没有使用测试替身。
+提交用的成片是 `recordings/AI生成的演示视频.mp4`（3 分 14 秒），由本脚本自动录制。录制使用真实 DeepSeek 模型、真实本机子进程和真实 SQLite，没有使用测试替身。
 
 ## 一 分镜
 
@@ -61,7 +61,7 @@
 3. 转码为 MP4：
 
    ```powershell
-   ffmpeg -i recordings/raw/<录制文件>.webm -c:v libx264 -preset slow -crf 25 -pix_fmt yuv420p -movflags +faststart -an recordings/demo.mp4
+   ffmpeg -i recordings/raw/<录制文件>.webm -c:v libx264 -preset slow -crf 25 -pix_fmt yuv420p -movflags +faststart -an "recordings/AI生成的演示视频.mp4"
    ```
 
    如需配音，按 `recordings/timeline.json` 里每段的 `at` 秒数放置音频（`adelay` 与 `amix`），字幕文本就是讲解词。
@@ -71,3 +71,10 @@
 - **用真实模型和真实子进程**：画面里出现的任务 ID、日志行号、GC 数值都能在任务管理和 `var/` 里复查，不是预录的假数据。
 - **演示脚本只驱动界面**：所有分析都走后端和 MCP 工具链，和人工点击完全同一条路径。
 - **失败场景保留原始日志**：sample3 的两条诊断（缺标题行、非法字符列区间）来自脚本 stderr，助手只是把它们翻译成自然语言；修复预览也由后端生成，界面只负责展示。
+
+## 四 人工讲解版
+
+本机还留有一份 1920×1080、带语音的人工讲解录制（8 分 19 秒，覆盖登录、两次分析、sample3 失败诊断、上传文件和任务管理）。
+
+它只保存在本地、不随仓库发布：整屏录制包含桌面和其他浏览器标签，公开前应先裁剪画面。评审要求的时长以 `AI生成的演示视频.mp4` 为准。
+
