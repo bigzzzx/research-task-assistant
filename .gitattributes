@@ -1,0 +1,12 @@
+# Keep source files LF so Docker builds and shell-free scripts behave the same on every clone.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.mp4 binary
+*.webm binary
+*.docx binary
+*.zip binary
+*.bundle binary
