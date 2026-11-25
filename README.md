@@ -44,25 +44,26 @@ cp .env.example .env          # Windows PowerShell: Copy-Item .env.example .env
 docker compose up --build
 ```
 
-首次构建会拉取 `node:22-alpine` 和 `python:3.12-slim` 并安装依赖，之后启动很快。浏览器打开 <http://localhost:8767>，注册账号（密码至少 7 位）即可开始。
+首次构建会从 Amazon ECR Public 拉取官方 `node:22-alpine` 和 `python:3.12-slim` 镜像，Python 依赖走腾讯云 PyPI 镜像，之后启动很快。浏览器打开 <http://localhost:8767>，注册账号（密码至少 7 位）即可开始。
 
 - 数据保存在命名卷里（默认名 `<目录名>_app-data`），`docker compose down` 不删数据，`docker compose down -v` 清空重来。
 - 端口被占用时用 `APP_PORT=9000 docker compose up --build`，然后访问 <http://localhost:9000>。
 - Ubuntu 服务器上的服务同样绑定回环地址。在自己的电脑上执行 `ssh -N -L 8767:127.0.0.1:8767 ubuntu@你的服务器`，再打开 <http://localhost:8767>。
 - Compose 直接从同目录的 `.env` 读取变量注入容器，镜像里不包含 `.env`，Key 不会被打进镜像。
 
-如果服务器拉取 Docker Hub 镜像超时，可在 `.env` 中指定 Docker 在 ECR Public 发布的镜像，再执行同一条启动命令。[Node 镜像](https://gallery.ecr.aws/docker/library/node) · [Python 镜像](https://gallery.ecr.aws/docker/library/python)
+默认镜像来自 Docker 在 ECR Public 发布的官方镜像，依赖默认从腾讯云 PyPI 镜像安装，这样在访问 Docker Hub / 官方 PyPI 较慢的网络里也能直接构建。[Node 镜像](https://gallery.ecr.aws/docker/library/node) · [Python 镜像](https://gallery.ecr.aws/docker/library/python)
+
+如果你的网络访问官方源更快，在 `.env` 里改回官方地址即可，启动命令不变：
 
 ```dotenv
-NODE_BASE_IMAGE=public.ecr.aws/docker/library/node:22-alpine
-PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.12-slim
+NODE_BASE_IMAGE=node:22-alpine
+PYTHON_BASE_IMAGE=python:3.12-slim
+PYTHON_PACKAGE_INDEX=https://pypi.org/simple
 ```
-
-若 Python 依赖下载较慢，可在 `.env` 中将 `PYTHON_PACKAGE_INDEX` 设为可访问的索引。这台 Ubuntu 服务器实测使用了 `https://mirrors.cloud.tencent.com/pypi/simple`。[腾讯云软件源说明](https://cloud.tencent.com/document/product/213/8623)
 
 ### Ubuntu 实机验证
 
-在 Ubuntu 24.04.4（Docker Engine 29.1.3、Compose 2.40.3）上执行 `docker compose up -d --build --wait`。前端构建使用服务器已缓存的 `NODE_BASE_IMAGE=node:24-alpine`，Python 运行镜像使用上面的 ECR Public 镜像，依赖索引使用腾讯云源；构建出的应用镜像约 58.7 MB。
+在 Ubuntu 24.04.4（Docker Engine 29.1.3、Compose 2.40.3）上，`.env` 只复制 `.env.example`、**不做任何镜像或索引覆盖**，执行 `docker compose build --no-cache` 与 `docker compose up -d --wait`；构建使用默认的 ECR Public 基础镜像和腾讯云 PyPI 镜像，产出应用镜像约 58.7 MB。
 
 - 容器达到 `healthy`；首页和前端 JS/CSS 返回 HTTP 200，未登录的 `/api/config` 返回 401。
 - 注册账号返回 201；`/api/tools` 列出 `submit_job`、`job_status`、`read_log` 三个 MCP 工具；上传 FASTA 返回 201 并出现在文件列表。
@@ -121,6 +122,7 @@ DEEPSEEK_INPUT_TOKEN_BUDGET=24000
 | 聊天提示未配置 Key | `.env` 没填或改完没重启后端；Docker 方式修改 `.env` 后执行 `docker compose up -d --build` |
 | 自定义 Python 脚本任务报 `DOCKER_NOT_FOUND` | 自定义脚本在一次性容器里执行，需要本机 Docker（Windows 用 Linux 容器）。Docker Compose 方式下容器内没有 Docker，只支持两个内置分析 |
 | 端口 8767 被占用 | 本机方式改 `--port`；Compose 方式用 `APP_PORT` |
+| 构建时卡在拉镜像或下载依赖 | 默认已用 ECR Public 镜像和腾讯云 PyPI 镜像；如果这对你的网络反而更慢，按上面的说明在 `.env` 里换回 Docker Hub 和 `https://pypi.org/simple`，或换成你附近可访问的源 |
 | `npm run build` 报 Node 版本错误 | 升级到 Node 22.12+ 或 20.19+ |
 
 ## 演示路径

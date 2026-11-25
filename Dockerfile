@@ -1,5 +1,5 @@
-ARG NODE_BASE_IMAGE=node:22-alpine
-ARG PYTHON_BASE_IMAGE=python:3.12-slim
+ARG NODE_BASE_IMAGE=public.ecr.aws/docker/library/node:22-alpine
+ARG PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.12-slim
 
 # 1) 用 Vite 构建前端静态资源
 FROM ${NODE_BASE_IMAGE} AS web
@@ -12,7 +12,7 @@ RUN npm run build
 
 # 2) 运行后端，并由同一个进程提供上一步构建的前端
 FROM ${PYTHON_BASE_IMAGE}
-ARG PYTHON_PACKAGE_INDEX=https://pypi.org/simple
+ARG PYTHON_PACKAGE_INDEX=https://mirrors.cloud.tencent.com/pypi/simple
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONUTF8=1 \
@@ -22,7 +22,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 COPY requirements.txt ./
-RUN python -m pip install --index-url "$PYTHON_PACKAGE_INDEX" -r requirements.txt
+RUN python -m pip install --timeout 60 --retries 5 --index-url "$PYTHON_PACKAGE_INDEX" -r requirements.txt
 
 COPY backend ./backend
 COPY scripts ./scripts
