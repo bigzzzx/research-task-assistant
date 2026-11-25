@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { type FormEvent, useEffect, useRef, useState } from 'react';
 import { ClipboardList, FileText, Plus, X } from 'lucide-react';
-import { accountUrl, type FailureCategory, type Job, type JobLog, type JobState, type LocalFile, request } from './api';
-import { ANALYSIS, STATES, Status, showSize } from './display';
+import { accountUrl, type AnalysisScript, type BuiltInAnalysis, type FailureCategory, type Job, type JobLog, type JobState,
+  type LocalFile, request } from './api';
+import { analysisLabel, STATES, Status, showSize } from './display';
 import { errorText } from './useWorkspace';
 
 const timestamp = new Intl.DateTimeFormat('zh-CN', {
@@ -105,6 +106,131 @@ export function FileManager({ files, onUpload, onAnalyze }: {
   );
 }
 
+const BUILT_IN_TASK_DESCRIPTIONS: Record<BuiltInAnalysis, string> = {
+  seq_stats: '统计 FASTA 中每条序列的 ID、长度和 GC 含量。',
+  find_orf: '查找每条序列正链上的最长完整开放阅读框，输出起止位置和长度。',
+};
+
+function ScriptTaskTypes({ onUse }: { onUse: (type: string) => void }) {
+  const picker = useRef<HTMLInputElement>(null);
+  const [scripts, setScripts] = useState<AnalysisScript[]>([]);
+  const [source, setSource] = useState<File>();
+  const [taskType, setTaskType] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void request<AnalysisScript[]>('/api/analysis-scripts', { signal: controller.signal })
+      .then(rows => { if (!controller.signal.aborted) setScripts(rows); })
+      .catch(failure => { if (!controller.signal.aborted) setError(errorText(failure)); })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, []);
+
+  async function register(event: FormEvent) {
+    event.preventDefault();
+    if (!source || !taskType.trim() || saving) return;
+    setSaving(true);
+    setError('');
+    setNotice('');
+    try {
+      const query = new URLSearchParams({ filename: source.name, task_type: taskType.trim() });
+      const script = await request<AnalysisScript>('/api/analysis-scripts?' + query, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: source,
+      });
+      setScripts(previous => [script, ...previous]);
+      if (picker.current) picker.current.value = '';
+      setSource(undefined);
+      setTaskType('');
+      setNotice('已登记 ' + script.task_type);
+    } catch (failure) {
+      setError(errorText(failure));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const current = new Map<string, AnalysisScript>();
+  for (const script of scripts) {
+    if (!current.has(script.task_type)) current.set(script.task_type, script);
+  }
+
+  return (
+    <>
+      <section className="management-section" aria-labelledby="built-in-task-heading">
+        <h2 id="built-in-task-heading">内置任务类型</h2>
+        <ul className="managed-files">
+          {(Object.keys(BUILT_IN_TASK_DESCRIPTIONS) as BuiltInAnalysis[]).map(type => (
+            <li className="managed-file" key={type}>
+              <span className="file-mark" aria-hidden="true" />
+              <div className="managed-file-label">
+                <strong>{analysisLabel({ analysis_type: type, task_type: null })} · <code>{type}</code></strong>
+                <span>{BUILT_IN_TASK_DESCRIPTIONS[type]}</span>
+              </div>
+              <button type="button" className="secondary-button" onClick={() => onUse(type)}>填入聊天</button>
+            </li>
+          ))}
+        </ul>
+      </section>
+      <section className="management-section catalog-card" aria-labelledby="script-task-heading">
+        <h2 id="script-task-heading">登记脚本任务</h2>
+        <p>登记后在聊天中指定任务类型和 FASTA 文件名。同一类型再次上传会登记新版本。</p>
+        <form className="extension-form" onSubmit={register}>
+          <div className="mcp-fields">
+            <label>Python 脚本
+              <input ref={picker} type="file" accept=".py" disabled={saving} required
+                onChange={event => {
+                  const file = event.target.files?.[0];
+                  setSource(file);
+                  if (file && !taskType) {
+                    setTaskType(file.name.replace(/\.py$/i, '').replace(/[^\p{L}\p{N}_-]+/gu, '_').slice(0, 64));
+                  }
+                }} />
+            </label>
+            <label>任务类型
+              <input value={taskType} placeholder="例如 count_records" maxLength={64} required disabled={saving}
+                onChange={event => setTaskType(event.target.value)} />
+            </label>
+          </div>
+          <div>
+            <button type="submit" className="primary-button" disabled={loading || saving || !source || !taskType.trim()}>
+              <Plus size={16} aria-hidden="true" /> {saving ? '正在登记' : '登记任务类型'}
+            </button>
+          </div>
+          {error && <p className="tone-error" role="alert">{error}</p>}
+          {notice && <p role="status">{notice}</p>}
+        </form>
+      </section>
+      <section className="management-section">
+        <h2>已登记的自定义任务类型</h2>
+        {current.size ? (
+          <ul className="managed-files">
+            {Array.from(current.values(), script => (
+              <li className="managed-file" key={script.task_type}>
+                <span className="file-mark" aria-hidden="true" />
+                <div className="managed-file-label">
+                  <code title={script.task_type}>{script.task_type}</code>
+                  <span title={script.sha256}>{script.display_name} · {script.sha256.slice(0, 8)} · {date(script.created_at)}</span>
+                </div>
+                <button type="button" className="secondary-button" onClick={() => onUse(script.task_type)}>
+                  填入聊天
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : <div className="management-empty"><FileText aria-hidden="true" />
+          <p>{loading ? '正在加载任务类型' : '还没有登记脚本任务'}</p>
+        </div>}
+      </section>
+    </>
+  );
+}
+
 type Stream = 'stdout' | 'stderr';
 
 function LogPanel({ job, stream }: { job: Job; stream: Stream }) {
@@ -163,7 +289,7 @@ const FAILURE_LABELS: Record<FailureCategory, string> = {
 const FAILURE_STAGES = { input: '读取输入', preparation: '准备任务', launch: '启动进程', execution: '执行脚本' };
 
 function TaskDetail({ job, clock, attempts, onSelect, onRetry, onClose, onConversation }: {
-  job: Job; clock: number; onClose: () => void; onConversation: (id: string) => void;
+  job: Job; clock: number; onClose: () => void; onConversation: (id: string, inputId?: string) => void;
   attempts: Job[]; onSelect: (id: string) => void; onRetry: (job: Job) => Promise<Job>;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
@@ -200,8 +326,12 @@ function TaskDetail({ job, clock, attempts, onSelect, onRetry, onClose, onConver
         </header>
         <dl className="task-data">
           <div className="task-id-detail"><dt>任务 ID</dt><dd><code>{job.id}</code></dd></div>
-          <div><dt>任务类型</dt><dd>{ANALYSIS[job.analysis_type]}</dd></div>
+          <div><dt>任务类型</dt><dd>{analysisLabel(job)}</dd></div>
           <div><dt>文件名称</dt><dd><code>{job.filename}</code></dd></div>
+          {job.script_name && <div>
+            <dt>脚本版本</dt>
+            <dd><code title={job.script_sha256 ?? undefined}>{job.script_name} · {job.script_sha256?.slice(0, 8)}</code></dd>
+          </div>}
           <div><dt>提交时间</dt><dd>{date(job.created_at)}</dd></div>
           <div><dt>执行时长</dt><dd>{runDuration(job, clock)}</dd></div>
           <div><dt>排队等待</dt><dd>
@@ -240,7 +370,7 @@ function TaskDetail({ job, clock, attempts, onSelect, onRetry, onClose, onConver
         {error && <p className="tone-error" role="alert">{error}</p>}
         <footer className="detail-footer">
           {job.state === 'failed' && !job.next_attempt_id && (job.input_request_id
-            ? <button className="primary-button" onClick={() => onConversation(job.conversation_id)}>补充文件并继续</button>
+            ? <button className="primary-button" onClick={() => onConversation(job.conversation_id, job.input_request_id ?? undefined)}>补充文件并继续</button>
             : <button className="primary-button" disabled={retrying} onClick={() => void retry()}>
               {retrying ? '正在提交' : '重新运行'}
             </button>)}
@@ -259,9 +389,11 @@ const FILTERS: Array<{ state: 'all' | JobState; label: string }> = [
   { state: 'failed', label: STATES.failed },
 ];
 
-export function TaskManager({ jobs, onConversation, onRetry }: {
-  jobs: Job[]; onConversation: (id: string) => void; onRetry: (job: Job) => Promise<Job>;
+export function TaskManager({ jobs, onConversation, onRetry, onUseType }: {
+  jobs: Job[]; onConversation: (id: string, inputId?: string) => void; onRetry: (job: Job) => Promise<Job>;
+  onUseType: (type: string) => void;
 }) {
+  const [tab, setTab] = useState<'history' | 'types'>('history');
   const [filter, setFilter] = useState<'all' | JobState>('all');
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<string>();
@@ -278,7 +410,7 @@ export function TaskManager({ jobs, onConversation, onRetry }: {
   const query = search.trim().toLowerCase();
   const results = jobs.filter(job =>
     (filter === 'all' || job.state === filter) &&
-    (job.id.includes(query) || job.filename.toLowerCase().includes(query)),
+    (job.id.includes(query) || job.filename.toLowerCase().includes(query) || analysisLabel(job).toLowerCase().includes(query)),
   ).sort((a, b) => b.created_at.localeCompare(a.created_at));
   const detail = jobs.find(job => job.id === selected);
   const attempts = detail ? jobs.filter(job =>
@@ -289,43 +421,49 @@ export function TaskManager({ jobs, onConversation, onRetry }: {
       <header className="management-heading"><div>
         <h1>任务管理</h1><p>查看当前账号跨会话的任务、执行时间和原始日志。</p>
       </div></header>
-      <div className="task-controls">
-        <div className="filters" aria-label="按状态筛选">
-          {FILTERS.map(item => (
-            <button key={item.state} type="button" aria-pressed={item.state === filter}
-              onClick={() => setFilter(item.state)}>{item.label}</button>
-          ))}
+      <nav className="extension-tabs" aria-label="任务管理视图">
+        <button type="button" aria-pressed={tab === 'history'} onClick={() => setTab('history')}>执行记录</button>
+        <button type="button" aria-pressed={tab === 'types'} onClick={() => setTab('types')}>任务类型</button>
+      </nav>
+      {tab === 'types' ? <ScriptTaskTypes onUse={onUseType} /> : <section aria-label="执行记录">
+        <div className="task-controls">
+          <div className="filters" aria-label="按状态筛选">
+            {FILTERS.map(item => (
+              <button key={item.state} type="button" aria-pressed={item.state === filter}
+                onClick={() => setFilter(item.state)}>{item.label}</button>
+            ))}
+          </div>
+          <input aria-label="搜索任务" placeholder="搜索文件名、类型或任务 ID" value={search}
+            onChange={event => setSearch(event.target.value)} />
         </div>
-        <input aria-label="搜索任务" placeholder="搜索文件名或任务 ID" value={search}
-          onChange={event => setSearch(event.target.value)} />
-      </div>
-      {results.length ? (
-        <div className="task-table-scroll">
-          <table className="task-table">
-            <thead><tr>
-              <th scope="col">任务 ID</th><th scope="col">任务类型</th><th scope="col">文件名称</th>
-              <th scope="col">执行状态</th><th scope="col">提交时间</th><th scope="col">执行时长</th><th scope="col">操作</th>
-            </tr></thead>
-            <tbody>{results.map(job => (
-              <tr key={job.id}>
-                <td className="task-id-cell"><code>{job.id}</code></td>
-                <td>{ANALYSIS[job.analysis_type]}</td>
-                <td className="task-file-cell" title={job.filename}>{job.filename}</td>
-                <td><Status state={job.state} /></td>
-                <td className="task-time-cell">{date(job.created_at)}</td>
-                <td>{runDuration(job, clock)}</td>
-                <td><button className="text-button" onClick={() => setSelected(job.id)}>查看日志</button></td>
-              </tr>
-            ))}</tbody>
-          </table>
-        </div>
-      ) : (
-        <div className="management-empty">
-          <ClipboardList aria-hidden="true" /><p>{jobs.length ? '没有符合条件的任务' : '还没有提交任务'}</p>
-        </div>
-      )}
-      {detail && <TaskDetail key={detail.id} job={detail} clock={clock} onClose={() => setSelected(undefined)}
-        attempts={attempts} onSelect={setSelected} onRetry={onRetry} onConversation={onConversation} />}
+        {results.length ? (
+          <div className="task-table-scroll">
+            <table className="task-table">
+              <thead><tr>
+                <th scope="col">任务 ID</th><th scope="col">任务类型</th><th scope="col">文件名称</th>
+                <th scope="col">执行状态</th><th scope="col">提交时间</th><th scope="col">执行时长</th><th scope="col">操作</th>
+              </tr></thead>
+              <tbody>{results.map(job => (
+                <tr key={job.id}>
+                  <td className="task-id-cell"><code>{job.id}</code></td>
+                  <td className="task-file-cell" title={analysisLabel(job)}>{analysisLabel(job)}</td>
+                  <td className="task-file-cell" title={job.filename}>{job.filename}</td>
+                  <td><Status state={job.state} /></td>
+                  <td className="task-time-cell">{date(job.created_at)}</td>
+                  <td>{runDuration(job, clock)}</td>
+                  <td><button className="text-button" onClick={() => setSelected(job.id)}>查看日志</button></td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="management-empty">
+            <ClipboardList aria-hidden="true" /><p>{jobs.length ? '没有符合条件的任务' : '还没有提交任务'}</p>
+          </div>
+        )}
+        {detail && <TaskDetail key={detail.id} job={detail} clock={clock} onClose={() => setSelected(undefined)}
+          attempts={attempts} onSelect={setSelected} onRetry={onRetry} onConversation={onConversation} />}
+      </section>}
     </div>
   );
 }

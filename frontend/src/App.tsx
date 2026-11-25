@@ -1,13 +1,12 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ChangeEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { X } from 'lucide-react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { AccountScreen } from './AccountScreen';
-import { AccountPreferences } from './AccountPreferences';
 import { accountUrl, bindAccount, request, RequestError, SESSION_CHANGED,
-  type Account, type Analysis, type Job, type LocalFile, type Message } from './api';
-import { ANALYSIS, Status, showSize } from './display';
+  type Account, type Job, type LocalFile, type Message } from './api';
+import { analysisLabel, Status, showSize } from './display';
 import { InputRecovery } from './InputRecovery';
 import { FileManager, TaskManager } from './Management';
 import { ToolManager } from './ToolManager';
@@ -47,6 +46,7 @@ type StatsRow = {
 type OrfRow = { id: string; orf: { start: number; end: number; length_nt: number } | null };
 type ToolOutput = {
   ok: boolean;
+  skill_name?: string;
   stdout?: string;
   stderr?: string;
   display_stdout?: string;
@@ -55,7 +55,7 @@ type ToolOutput = {
   server_name?: string;
   job_id?: string;
   state?: Job['state'];
-  analysis_type?: Analysis;
+  analysis_type?: string;
   stdout_truncated?: boolean;
   stderr_truncated?: boolean;
 };
@@ -69,7 +69,8 @@ function asOutput(message?: Message): ToolOutput | undefined {
   }
 }
 
-function ResultTable({ log, analysisType }: { log?: string; analysisType?: Analysis }) {
+function ResultTable({ log, analysisType }: { log?: string; analysisType?: string }) {
+  if (analysisType !== 'seq_stats' && analysisType !== 'find_orf') return null;
   const rows: (StatsRow | OrfRow)[] = [];
   for (const line of log?.split('\n') ?? []) {
     try {
@@ -137,7 +138,8 @@ function ToolCards({ invocation, observations }: { invocation: Message; observat
           <details className="tool" key={call.id}>
             <summary>
               <span className="tool-glyph" aria-hidden="true">⌘</span>
-              <code>{output?.tool ?? call.function.name}</code>
+              <code>{output?.skill_name ?? output?.tool ?? call.function.name}</code>
+              {output?.skill_name && <span className="tool-source">已加载技能</span>}
               {output?.server_name && <span className="tool-source">{output.server_name}</span>}
               {invocation.source === 'system' && <span className="tool-source">系统读取</span>}
               <span className={'tool-status ' + (output?.ok === false ? 'tone-error' : '')}>
@@ -165,6 +167,7 @@ function MessageView({ message, jobs, observations }: {
 }) {
   if (message.kind === 'tool') return null;
   if (message.kind === 'invocation') return <ToolCards invocation={message} observations={observations} />;
+  if (message.kind === 'input_reminder') return <p className="input-reminder">{message.content}</p>;
   const user = message.kind === 'user';
   const job = jobs.find(item => item.id === message.job_id);
   if (!user && message.status === 'running' && !message.content) return null;
@@ -175,7 +178,7 @@ function MessageView({ message, jobs, observations }: {
       </span>}
       <div className="message-inner">
         <div className="message-meta">
-          <span>{user ? '你' : job ? ANALYSIS[job.analysis_type] + ' · ' + job.filename : '科研计算助手'}</span>
+          <span>{user ? '你' : job ? analysisLabel(job) + ' · ' + job.filename : '科研计算助手'}</span>
           {job && <code title={job.id}>{job.id.slice(0, 8)}</code>}
           <time dateTime={message.created_at}>{showTime(message.created_at)}</time>
           {message.status === 'interrupted' && <span className="tone-error">已中断</span>}
@@ -195,14 +198,16 @@ function MessageView({ message, jobs, observations }: {
   );
 }
 
-function JobCards({ jobs, onRetry }: { jobs: Job[]; onRetry: (job: Job) => void }) {
+function JobCards({ jobs, onRetry, onRecover }: {
+  jobs: Job[]; onRetry: (job: Job) => void; onRecover: (job: Job) => void;
+}) {
   if (!jobs.length) return <p className="muted rail-empty">提交分析后，可在这里查看状态和日志。</p>;
   return (
     <div className="job-list">
       {jobs.map(job => (
         <article className="job-card" key={job.id}>
           <div className="job-title"><strong title={job.filename}>{job.filename}</strong><Status state={job.state} /></div>
-          <div className="job-meta"><span>{ANALYSIS[job.analysis_type]}</span><code title={job.id}>{job.id.slice(0, 8)}</code></div>
+          <div className="job-meta"><span>{analysisLabel(job)}</span><code title={job.id}>{job.id.slice(0, 8)}</code></div>
           {job.finished_at && <div className="job-meta">
             <span>{job.summary_state === 'running' || job.summary_state === 'pending' ? '等待解释' : showTime(job.finished_at)}</span>
             {job.exit_code !== null && <span>退出码 {job.exit_code}</span>}
@@ -214,6 +219,8 @@ function JobCards({ jobs, onRetry }: { jobs: Job[]; onRetry: (job: Job) => void 
               <a href={accountUrl('/api/jobs/' + job.id + '/logs/stderr')}>错误日志</a>
             </>}
             {job.summary_state === 'error' && <button onClick={() => onRetry(job)}>重新解释</button>}
+            {job.state === 'failed' && job.input_request_id && !job.next_attempt_id &&
+              <button type="button" onClick={() => onRecover(job)}>补充文件</button>}
           </div>}
         </article>
       ))}
@@ -277,10 +284,9 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
   const { section, navigate, label } = useSection();
   const { activeId, room, config } = workspace;
   const [drafts, setDrafts] = useState<Record<string, string>>({});
-  const [creating, setCreating] = useState(false);
   const [posting, setPosting] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const [showPreferences, setShowPreferences] = useState(false);
+  const [openedInputId, setOpenedInputId] = useState<string>();
   const [mobilePanel, setMobilePanel] = useState<'history' | 'jobs' | null>(null);
   const composer = useRef<HTMLTextAreaElement>(null);
   const form = useRef<HTMLFormElement>(null);
@@ -290,6 +296,15 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
   const current = workspace.conversations.find(row => row.id === activeId);
   const uploaded = workspace.files.filter(file => file.source === 'upload');
   const history = room.messages;
+  const lastUserAt = history.reduce(
+    (latest, message) => message.kind === 'user' ? message.created_at : latest, '',
+  );
+  const visibleInputs = room.input_requests.filter(input =>
+    input.id === openedInputId || (!input.reminder_message_id && input.created_at >= lastUserAt),
+  );
+  const hiddenMissingInputs = room.input_requests.filter(input =>
+    !input.failed_job_id && !input.resolved_job_id && !visibleInputs.includes(input),
+  );
   const draftKey = activeId || '';
   const draft = drafts[draftKey] ?? '';
   const pending = history.filter(message => message.kind === 'user' && (message.status === 'queued' || message.status === 'running')).length;
@@ -317,7 +332,7 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
   useLayoutEffect(() => {
     const target = scroll.current;
     if (target && followEnd.current) target.scrollTop = target.scrollHeight;
-  }, [activeId, history, room.input_requests, section]);
+  }, [activeId, history, room.input_requests, openedInputId, section]);
 
   function fill(text: string) {
     setDrafts(previous => ({ ...previous, [draftKey]: text }));
@@ -326,23 +341,17 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
     requestAnimationFrame(() => composer.current?.focus());
   }
 
-  async function create() {
-    setCreating(true);
-    workspace.setNotice('');
-    try {
-      await workspace.create();
-      navigate('home');
-      setMobilePanel(null);
-      requestAnimationFrame(() => composer.current?.focus());
-    } catch (error) {
-      workspace.setNotice(errorText(error));
-    } finally {
-      setCreating(false);
-    }
+  function create() {
+    workspace.startDraft();
+    setOpenedInputId(undefined);
+    navigate('home');
+    setMobilePanel(null);
+    requestAnimationFrame(() => composer.current?.focus());
   }
 
-  function choose(id: string) {
+  function choose(id: string, inputId?: string) {
     followEnd.current = true;
+    setOpenedInputId(inputId);
     navigate('home');
     setMobilePanel(null);
     workspace.select(id);
@@ -364,6 +373,7 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
     followEnd.current = true;
     try {
       await workspace.send(text);
+      setOpenedInputId(current => current === openedInputId ? undefined : current);
       setDrafts(previous => previous[draftKey]?.trim() === text ? { ...previous, [draftKey]: '' } : previous);
     } catch (error) {
       workspace.setNotice(errorText(error));
@@ -381,11 +391,11 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
     workspace.setNotice('');
     try {
       if (config && file.size > config.upload_limit) throw new Error('文件超过 5 MiB，请使用较小的 FASTA。');
-      const conversationId = activeId ?? await workspace.create();
+      const conversationId = activeId ?? undefined;
       const saved = await workspace.upload(file, conversationId);
       setDrafts(previous => ({
         ...previous,
-        [conversationId]: previous[conversationId] ||
+        [draftKey]: previous[draftKey] ||
           '帮我统计 ' + saved.display_name + ' 中每条序列的长度和 GC 含量。',
       }));
       composer.current?.focus();
@@ -416,7 +426,7 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
           <div className="brand-mark" aria-hidden="true"><i /><i /><i /></div>
           <div>科研计算助手</div>
         </div>
-        <button className="new-chat" disabled={creating} onClick={create}>
+        <button className="new-chat" onClick={create}>
           <span aria-hidden="true">＋</span> 新建会话
         </button>
         <div className="sidebar-list">
@@ -438,7 +448,6 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
         <div className="sidebar-footer" title={account.username}>
           <span className="account-initial" aria-hidden="true">{Array.from(account.username)[0].toUpperCase()}</span>
           <span className="current-account">{account.username}</span>
-          <button type="button" className="preferences-link" onClick={() => setShowPreferences(true)}>分析偏好</button>
         </div>
       </aside>
 
@@ -457,12 +466,6 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
               <div className="config-banner">
                 <strong>DeepSeek 尚未配置</strong>
                 <span>在 <code>.env</code> 填入 <code>DEEPSEEK_API_KEY</code> 后重启后端，即可发送消息。</span>
-              </div>
-            )}
-            {config && !config.research_mcp_added && (
-              <div className="config-banner">
-                <strong>连接科研工具后即可分析样例和上传文件</strong>
-                <button type="button" className="secondary-button" onClick={() => navigate('tools')}>添加本机 MCP</button>
               </div>
             )}
             <div className="chat-scroll" ref={scroll} onScroll={() => {
@@ -485,9 +488,15 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
                 ) : (
                   <div className="message-stack" aria-label="会话记录">
                     {history.map(message => (
-                      <MessageView key={message.id} message={message} jobs={room.jobs} observations={observations} />
+                      <Fragment key={message.id}>
+                        <MessageView message={message} jobs={room.jobs} observations={observations} />
+                        {message.kind === 'user' && hiddenMissingInputs.filter(input => input.origin_message_id === message.id).map(input => (
+                          <button key={input.id} type="button" className="secondary-button input-reopen"
+                            onClick={() => choose(input.conversation_id, input.id)}>补充 {input.filename}</button>
+                        ))}
+                      </Fragment>
                     ))}
-                    {room.input_requests.map(input => (
+                    {visibleInputs.map(input => (
                       <InputRecovery key={input.id} input={input} files={workspace.files}
                         onUpload={workspace.upload} onResolve={workspace.resolveInput} />
                     ))}
@@ -552,17 +561,18 @@ function Workspace({ account, onLogout }: { account: Account; onLogout: () => Pr
             </section>}
             <section className="rail-section tasks" aria-label="任务记录">
               <div className="rail-heading"><h2>任务记录</h2>{!!room.jobs.length && <span>{room.jobs.length}</span>}</div>
-              <JobCards jobs={room.jobs} onRetry={retry} />
+              <JobCards jobs={room.jobs} onRetry={retry}
+                onRecover={job => choose(job.conversation_id, job.input_request_id ?? undefined)} />
             </section>
           </aside>
         </div> : <main className="management" aria-label={label}>
           {workspace.notice && <p className="management-notice tone-error" role="alert">{workspace.notice}</p>}
           {section === 'files' && <FileManager files={workspace.files} onUpload={workspace.upload} onAnalyze={suggestFile} />}
-          {section === 'tasks' && <TaskManager jobs={workspace.jobs} onConversation={choose} onRetry={workspace.retryJob} />}
+          {section === 'tasks' && <TaskManager jobs={workspace.jobs} onConversation={choose} onRetry={workspace.retryJob}
+            onUseType={type => fill('用 ' + type + ' 分析 ')} />}
           {section === 'tools' && <ToolManager />}
         </main>}
       </div>
-      {showPreferences && <AccountPreferences onClose={() => setShowPreferences(false)} />}
       {workspace.toast && <div className="toast" role="status">
         <span>{workspace.toast.text}</span>
         <button onClick={() => choose(workspace.toast!.conversationId)}>查看会话</button>

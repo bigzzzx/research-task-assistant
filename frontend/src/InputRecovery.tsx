@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useId, useRef, useState } from 'react';
 import { type InputDiagnostics, type InputIssue, type InputRequest, type LocalFile, type SourceExcerpt, request } from './api';
-import { ANALYSIS } from './display';
+import { analysisLabel } from './display';
 import { errorText } from './useWorkspace';
 
 function Excerpt({ issue, excerpt }: { issue: InputIssue; excerpt: SourceExcerpt }) {
@@ -113,7 +113,7 @@ export function InputRecovery({ input, files, onUpload, onResolve }: {
       </div>
       {hasIssues && diagnostics && <Issues diagnostics={diagnostics} />}
       {diagnosticsError && <p className="tone-error" role="alert">{diagnosticsError}</p>}
-      <p>{input.failed_job_id ? '上传或选择修正版后继续' : '选择或上传文件后继续'}{ANALYSIS[input.analysis_type]}。</p>
+      <p>{input.failed_job_id ? '上传或选择修正版后继续' : '选择或上传文件后继续'}{analysisLabel(input)}。</p>
       <div className="input-recovery-actions">
         <label htmlFor={selectId}>选择文件</label>
         <select id={selectId} value={fileId} disabled={busy} onChange={event => setFileId(event.target.value)}>

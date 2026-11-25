@@ -50,7 +50,7 @@ export function useWorkspace(accountId: string) {
   const [toast, setToast] = useState<{ conversationId: string; text: string }>();
   const listRequest = useRef(0);
   const initialized = useRef(false);
-  const creating = useRef<Promise<string> | null>(null);
+  const draftConversation = useRef<Promise<string> | null>(null);
   const sendAttempts = useRef(new Map<string, { text: string; id: string }>());
 
   const mutateRoom = useCallback((id: string, update: (room: Room) => Room) => {
@@ -97,6 +97,14 @@ export function useWorkspace(accountId: string) {
     });
   }, [conversationKey, loadRoom]);
 
+  function startDraft() {
+    draftConversation.current = null;
+    activeRef.current = null;
+    localStorage.setItem(conversationKey, '');
+    setActiveId(null);
+    setNotice('');
+  }
+
   const refreshList = useCallback(async () => {
     const token = ++listRequest.current;
     const result = await request<Conversation[]>('/api/conversations');
@@ -105,7 +113,7 @@ export function useWorkspace(accountId: string) {
     if (!initialized.current) {
       initialized.current = true;
       const remembered = localStorage.getItem(conversationKey);
-      const target = result.find(item => item.id === remembered) ?? result[0];
+      const target = remembered === '' ? undefined : result.find(item => item.id === remembered) ?? result[0];
       if (target && !activeRef.current) select(target.id);
     }
     const current = result.find(item => item.id === activeRef.current);
@@ -167,7 +175,6 @@ export function useWorkspace(accountId: string) {
       refreshResources();
       if (activeRef.current) void loadRoom(activeRef.current).catch(report);
     });
-    listen('config.updated', () => { void getConfig().catch(report); });
     source.onerror = () => {
       if (!alive) return;
       void getConfig().catch(report);
@@ -219,35 +226,37 @@ export function useWorkspace(accountId: string) {
     };
   }, [loadRoom, markSeen, recordInputRequest, recordJob, recordMessage, refreshList]);
 
-  async function create(): Promise<string> {
-    if (creating.current) return creating.current;
-    creating.current = request<Conversation>('/api/conversations', { method: 'POST' }).then(row => {
-      setConversations(previous => [row, ...previous.filter(item => item.id !== row.id)]);
-      select(row.id);
-      void refreshList().catch(error => setNotice(errorText(error)));
-      return row.id;
-    });
-    try {
-      return await creating.current;
-    } finally {
-      creating.current = null;
-    }
-  }
-
   async function send(text: string): Promise<void> {
-    const id = activeRef.current ?? await create();
+    let id = activeRef.current;
+    let draftRequest: Promise<string> | null = null;
+    if (!id) {
+      draftRequest = draftConversation.current ??= request<Conversation>('/api/conversations', { method: 'POST' })
+        .then(row => row.id);
+      try {
+        id = await draftRequest;
+      } catch (error) {
+        if (draftConversation.current === draftRequest) draftConversation.current = null;
+        throw error;
+      }
+    }
     const prior = sendAttempts.current.get(id);
     const attempt = prior?.text === text ? prior : { id: crypto.randomUUID(), text };
     sendAttempts.current.set(id, attempt);
-    const message = await sendText(id, text, attempt.id);
+    const { input_reminder, ...message } = await sendText(id, text, attempt.id);
     sendAttempts.current.delete(id);
     recordMessage(message);
+    if (input_reminder) recordMessage(input_reminder);
+    if (draftRequest && draftConversation.current === draftRequest) {
+      draftConversation.current = null;
+      if (!activeRef.current) select(id);
+    }
     void refreshList().catch(error => setNotice(errorText(error)));
   }
 
   async function upload(file: File, conversationId?: string): Promise<LocalFile> {
     const result = await uploadFile(file, conversationId);
     setFiles(previous => mergeRows(previous, [result]));
+    if (conversationId) void refreshList().catch(error => setNotice(errorText(error)));
     return result;
   }
 
@@ -280,6 +289,6 @@ export function useWorkspace(accountId: string) {
 
   return {
     config, conversations, files, jobs, activeId, room: activeId ? rooms[activeId] ?? EMPTY_ROOM : EMPTY_ROOM,
-    seen, notice, setNotice, toast, setToast, select, create, send, upload, retrySummary, retryJob, resolveInput,
+    seen, notice, setNotice, toast, setToast, select, startDraft, send, upload, retrySummary, retryJob, resolveInput,
   };
 }

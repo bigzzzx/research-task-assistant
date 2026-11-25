@@ -69,18 +69,6 @@
   font-weight: 660;
 }
 .current-account { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.preferences-link {
-  margin-left: auto;
-  flex-shrink: 0;
-  padding: 4px 6px;
-  border-radius: 5px;
-  border: 1px solid #3f6759;
-  background: transparent;
-  color: #deeee6;
-  font: inherit;
-}
-.preferences-link:hover { background: #22483e; }
-
 .account-page {
   min-height: 100dvh;
   display: grid;
@@ -229,19 +217,6 @@
   background: #fff;
 }
 .task-detail::backdrop { background: #11271f70; }
-.preferences-dialog { width: min(430px, calc(100vw - 28px)); }
-.preferences-hint { margin: 12px 0; color: var(--muted); line-height: 1.5; }
-.preferences-form { display: grid; gap: 7px; }
-.preferences-form label { margin-top: 6px; font-weight: 600; }
-.preferences-form select {
-  padding: 7px 9px;
-  border: 1px solid #cdded3;
-  border-radius: 6px;
-  color: var(--ink);
-  background: #fbfdfb;
-  font: inherit;
-}
-.preferences-form .primary-button { margin-top: 8px; justify-self: end; }
 .detail-content { padding: clamp(13px, 3vw, 28px); }
 .detail-header, .detail-header > div { display: flex; align-items: center; gap: 10px; }
 .detail-header { justify-content: space-between; }
@@ -322,24 +297,117 @@
 .input-repair-preview button { margin-top: 4px; }
 .input-resolved { padding: 8px 0; }
 .input-resolved code { margin-inline-start: 6px; }
+.input-reminder { margin-inline-start: 39px; color: var(--muted); font-size: 13px; line-height: 1.6; white-space: pre-line; }
+.input-reopen { align-self: flex-start; margin-inline-start: 39px; }
 
+.tool-management { max-width: 1180px; padding: clamp(18px, 3vw, 40px); }
+.tool-management .management-heading { margin-bottom: 17px; }
+.extension-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 24px;
+  border-bottom: 1px solid var(--line);
+}
+.extension-tabs button {
+  padding: 9px 12px 10px;
+  margin-bottom: -1px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  background: transparent;
+  font-size: 14px;
+  font-weight: 600;
+}
+.extension-tabs button:hover { color: var(--accent); background: #edf4ef; }
+.extension-tabs button[aria-pressed="true"] { color: var(--accent-dark); border-bottom-color: var(--accent); }
+.tool-groups { display: grid; gap: 26px; }
+.tool-group, .tool-group-name { min-width: 0; }
+.tool-group-heading, .tool-group-name { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
+.tool-group-heading { justify-content: space-between; margin-bottom: 10px; }
+.tool-group-name { color: #355e50; }
+.tool-group-name h2 { font-size: 15px; color: var(--ink); overflow-wrap: anywhere; }
+.tool-transport { font-size: 12px; color: var(--muted); padding-inline-start: 8px; border-inline-start: 1px solid #c0cfc6; }
+.tool-count { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.tool-service-paused { margin: 0 0 10px; font-size: 13px; color: #6a542f; }
 .tool-catalog {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 254px), 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 15rem), 1fr));
   gap: 12px;
-  align-items: start;
 }
+.tool-card {
+  display: grid;
+  grid-template-rows: 2.6rem 2.65rem auto;
+  gap: 8px;
+  min-width: 0;
+  padding: 15px 15px 8px;
+  border: 1px solid #d5e1d9;
+  border-radius: 11px;
+  background: var(--paper);
+  box-shadow: 0 1px 3px #173e2f08;
+}
+.tool-card:focus-within { border-color: #79a491; }
+.tool-card-heading { display: flex; align-items: flex-start; gap: 9px; min-width: 0; }
+.tool-icon { display: grid; place-items: center; flex: 0 0 26px; height: 26px; border-radius: 7px; background: #eaf3ed; color: #286451; }
+.tool-card-heading h3, .tool-preview {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.tool-card-heading h3 { margin: 2px 0 0; font-size: .91rem; line-height: 1.3; }
+.tool-preview { align-self: start; font-size: .875rem; line-height: 1.5; color: var(--muted); }
+.tool-card-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-top: 6px; border-top: 1px solid #e7eee9; }
+.setting-switch, .tool-details-link { display: inline-flex; align-items: center; min-height: 32px; font-size: 13px; }
+.setting-switch { gap: 7px; cursor: pointer; white-space: nowrap; color: var(--muted); }
+.setting-switch input {
+  appearance: none;
+  position: relative;
+  width: 34px;
+  height: 20px;
+  margin: 0;
+  border: 1px solid #82948b;
+  border-radius: 20px;
+  background: #83938b;
+  cursor: inherit;
+}
+.setting-switch input::before {
+  content: "";
+  position: absolute;
+  inset: 2px auto auto 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform .15s ease;
+}
+.setting-switch input:checked { background: var(--accent); border-color: var(--accent); }
+.setting-switch input:checked::before { transform: translateX(14px); }
+.setting-switch input:focus-visible { outline: 2px solid #278b70; outline-offset: 3px; }
+.setting-switch input:disabled { opacity: .6; cursor: default; }
+.tool-details-link { gap: 2px; padding: 0 1px 0 8px; background: transparent; border: 0; color: var(--accent); }
+.tool-details-link:hover { text-decoration: underline; }
+.tool-dialog { width: min(620px, calc(100vw - 28px)); }
+.tool-dialog h2 { min-width: 0; font-size: 18px; overflow-wrap: anywhere; }
+.tool-dialog .detail-close { flex-shrink: 0; }
+.tool-origin { margin: 8px 0 18px; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.tool-full-description, .tool-dialog pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.tool-full-description { font-size: 15px; line-height: 1.65; }
+.tool-dialog h3 { margin: 20px 0 8px; font-size: 15px; }
+.tool-dialog pre { margin: 0; padding: 14px; border-radius: 8px; background: #f1f6f2; font-size: 13px; line-height: 1.55; }
 .catalog-card { padding: 15px; background: #fff; border: 1px solid var(--line); border-radius: 9px; }
 .catalog-title { display: flex; align-items: center; gap: 8px; color: #245746; }
 .catalog-title h2 { font-size: 16px; overflow-wrap: anywhere; }
 .catalog-card p { color: var(--muted); font-size: 14px; line-height: 1.6; }
 .catalog-card p { margin-top: 10px; }
-.extension-tabs, .extension-row, .extension-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
-.extension-tabs { margin-bottom: 16px; }
-.extension-tabs button[aria-pressed="true"] { color: #fff; background: #1b6451; border-color: #1b6451; }
+.extension-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .extension-stack { display: grid; gap: 12px; }
 .extension-stack .catalog-card { min-width: 0; }
 .extension-stack code { overflow-wrap: anywhere; }
+.mcp-list-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.mcp-list-heading h2 { font-size: 16px; margin: 0; }
+.mcp-list-heading button { display: inline-flex; align-items: center; gap: 6px; }
+.mcp-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 10px; }
 .extension-switch { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .extension-switch input { accent-color: #246c57; }
 .extension-form { display: grid; gap: 10px; max-width: 680px; margin-top: 12px; }
@@ -354,8 +422,12 @@
   color: inherit;
   font: inherit;
 }
-.extension-details { margin-top: 10px; }
-.extension-details pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f4f8f5; padding: 8px; border-radius: 6px; }
+.skill-editor .extension-form { max-width: none; }
+.skill-editor textarea { resize: vertical; font: .875rem/1.65 var(--mono); }
+.skill-editor details { overflow-wrap: anywhere; }
+.skill-card { display: grid; gap: 12px; overflow-wrap: anywhere; }
+.skill-card .skill-command { font-size: 13px; }
+.skill-download { text-decoration: none; }
 
 @media (max-width: 1080px) {
   .workspace { grid-template-columns: 55px 204px minmax(0, 1fr); }
@@ -395,4 +467,5 @@
 }
 @media (prefers-reduced-motion: reduce) {
   .nav-tooltip { transition: none; }
+  .setting-switch input::before { transition: none; }
 }

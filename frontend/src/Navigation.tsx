@@ -5,7 +5,7 @@ const ITEMS = [
   { id: 'home', label: '首页', Icon: House },
   { id: 'files', label: '文件管理', Icon: FolderOpen },
   { id: 'tasks', label: '任务管理', Icon: ClipboardList },
-  { id: 'tools', label: '工具管理', Icon: Wrench },
+  { id: 'tools', label: '扩展管理', Icon: Wrench },
 ] as const;
 
 export type Section = (typeof ITEMS)[number]['id'];

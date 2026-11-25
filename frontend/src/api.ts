@@ -1,5 +1,6 @@
 export type JobState = 'queued' | 'running' | 'succeeded' | 'failed';
-export type Analysis = 'seq_stats' | 'find_orf';
+export type BuiltInAnalysis = 'seq_stats' | 'find_orf';
+export type Analysis = BuiltInAnalysis | 'custom_python';
 export type FailureCategory = 'input' | 'configuration' | 'temporary_resource' | 'resource_limit'
   | 'timeout' | 'interrupted' | 'unknown';
 
@@ -26,7 +27,7 @@ export interface Message {
   id: number;
   conversation_id: string;
   turn_id: number | null;
-  kind: 'user' | 'assistant' | 'invocation' | 'tool' | 'summary';
+  kind: 'user' | 'assistant' | 'invocation' | 'tool' | 'summary' | 'input_reminder';
   status: 'queued' | 'running' | 'done' | 'interrupted' | 'error';
   content: string;
   revision: number;
@@ -43,6 +44,10 @@ export interface Job {
   conversation_id: string;
   filename: string;
   analysis_type: Analysis;
+  task_type: string | null;
+  script_id: string | null;
+  script_name: string | null;
+  script_sha256: string | null;
   state: JobState;
   summary_state: 'pending' | 'running' | 'done' | 'error';
   started_at: string | null;
@@ -66,15 +71,28 @@ export interface Job {
   revision: number;
 }
 
+export interface AnalysisScript {
+  id: string;
+  display_name: string;
+  task_type: string;
+  sha256: string;
+  size_bytes: number;
+  created_at: string;
+}
+
 export interface InputRequest {
   id: string;
   conversation_id: string;
+  origin_message_id: number;
   filename: string;
   analysis_type: Analysis;
+  task_type: string | null;
   failed_job_id: string | null;
   original_file_id: string | null;
   failure_code: string | null;
   resolved_job_id: string | null;
+  reminder_message_id: number | null;
+  created_at: string;
   revision: number;
 }
 
@@ -114,14 +132,16 @@ export interface LocalFile {
   created_at: string | null;
 }
 
+export type McpTransport = 'streamable-http' | 'sse' | 'stdio';
+
 export interface ToolDefinition {
   name: string;
   display_name: string;
   description: string;
   parameters: Record<string, unknown>;
+  server_id: string | null;
   server_name: string;
-  transport: 'stdio' | 'streamable-http';
-  required: boolean;
+  transport: McpTransport;
   enabled: boolean;
   available: boolean;
   server_enabled: boolean;
@@ -131,6 +151,7 @@ export interface McpServer {
   id: string;
   name: string;
   endpoint: string;
+  transport: McpTransport;
   tool_count: number;
   enabled: boolean;
   available: boolean;
@@ -138,18 +159,23 @@ export interface McpServer {
 }
 
 export interface McpSettings {
-  research_added: boolean;
-  research_command: string[];
-  endpoints: string[];
+  research: { name: string; tool_count: number };
+  stdio_servers: string[];
+  stdio_config_error: string | null;
+  trusted_endpoints: string[];
   servers: McpServer[];
 }
 
 export interface Skill {
   id: string;
   name: string;
-  trigger: string;
-  instructions: string;
+  description: string;
   enabled: boolean;
+}
+
+export interface SkillDetail extends Skill {
+  document: string;
+  files: string[];
 }
 
 export interface JobLog {
@@ -164,7 +190,6 @@ export interface Config {
   key_configured: boolean;
   samples: string[];
   upload_limit: number;
-  research_mcp_added: boolean;
 }
 
 export interface Room {
@@ -215,7 +240,7 @@ export async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
-export function sendText(id: string, text: string, clientId: string): Promise<Message> {
+export function sendText(id: string, text: string, clientId: string): Promise<Message & { input_reminder?: Message }> {
   return request(roomPath(id) + '/messages', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
