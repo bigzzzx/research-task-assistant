@@ -1,0 +1,32 @@
+# 一条命令启动应用：docker compose up --build
+# 模型 Key 从同目录的 .env 读取；没有 .env 时应用仍可登录和查看样例，聊天区会提示配置 Key。
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: research-task-assistant:local
+    container_name: research-task-assistant
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8767}:8767"
+    environment:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-flash}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_INPUT_TOKEN_BUDGET: ${DEEPSEEK_INPUT_TOKEN_BUDGET:-24000}
+      MCP_HTTP_ENDPOINTS: ${MCP_HTTP_ENDPOINTS:-}
+      MCP_STDIO_SERVERS: ${MCP_STDIO_SERVERS:-}
+    volumes:
+      # 会话、上传文件和任务日志保存在命名卷里，重建容器不丢数据。
+      - app-data:/app/var
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8767), 3).close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+
+volumes:
+  app-data:
