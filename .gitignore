@@ -15,3 +15,11 @@ frontend/*.tsbuildinfo
 # Interview material and Office lock files stay local
 /智能体开发实践考题*.docx
 ~$*.docx
+
+# Demo recording scratch space
+recordings/raw/
+demo-data/
+.testtmp/
+.npmcache/
+.compose-check/
+probe-*/

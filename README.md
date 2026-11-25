@@ -1,12 +1,60 @@
 # 科研计算任务助手
 
-在本机用自然语言提交 FASTA 分析，查看任务状态，再根据实际输出和错误日志解释结果。界面保留每次工具的名称、入参与返回值。会话、上传文件和计算结果在关闭页面或重启后端后仍可查阅。
+研究员用中文对话提交 FASTA 分析，助手自己调用工具、在本机启动脚本、读取日志并用普通人能看懂的话解释结果。界面保留每次工具调用的名称、入参和返回值，会话、上传文件和任务记录在刷新页面或重启后端后仍然存在。
 
-## 启动
+## 功能对照
 
-项目需要 Python 3.12 和满足 Vite 要求的 Node.js。当前开发环境使用 Python 3.12.14 和 Node.js 24.15.0。使用独立电脑复现时，可安装 Python 3.12 和 Node.js 22.12 或更新的 LTS。以下命令均在仓库根目录执行。
+**必做项**
 
-### Windows PowerShell
+| 题目要求 | 当前实现 |
+| --- | --- |
+| 聊天界面、回复流式显示 | React 单页，SSE 逐字推送正文和工具记录 |
+| 工具调用可见（名称、参数、返回） | 每条工具调用一张可折叠卡片，参数与结果都在卡片里 |
+| 左侧历史会话，可新建/切换 | 会话列表按账号返回，切换和刷新后从 SQLite 恢复 |
+| 自己实现 ReAct 循环 | `backend/app/agent.py` 手写“模型思考 → 调工具 → 拿结果 → 继续”循环，未使用低代码平台 |
+| 三个工具 | `submit_job`、`job_status`、`read_log`，经本机 MCP Server 暴露 |
+| 任务异步执行，不阻塞对话 | 后台独立子进程 + 队列，提交后立即返回任务 ID |
+| `seq_stats` / `find_orf` 两个脚本 | `scripts/seq_stats.py`、`scripts/find_orf.py`，各带 4 秒模拟耗时 |
+| 失败时主动读日志并解释 | 失败任务由助手自动 `read_log` 后解释，附可定位到行列的诊断 |
+| 会话与消息入库 | SQLite（`var/assistant.sqlite3`），重启后继续排队任务和处理 |
+
+**加分项**
+
+| 加分项 | 状态 |
+| --- | --- |
+| 用 MCP 协议封装三个工具 | 已做：本机 stdio MCP Server，后端是 MCP Client；另外支持登记外部 MCP 服务 |
+| 任务完成后主动通知前端 | 已做：任务终态通过 SSE 推送，并在原会话自动续答 |
+| 界面上传自己的 FASTA | 已做：每个账号独立文件区，单文件上限 5 MiB |
+| 关键逻辑有单元测试 | 已做：66 个用例，见[测试](#测试) |
+| Docker Compose 一键启动 | 已做：`docker compose up --build` |
+
+## 快速开始
+
+### 环境要求
+
+- **方式一（推荐）**：Docker Desktop（Windows/macOS）或 Docker Engine + Compose v2。
+- **方式二**：Python 3.12、Node.js `^20.19.0 || >=22.12.0`（Vite 7 的要求）。
+- 一个 DeepSeek API Key（[申请入口](https://platform.deepseek.com/)）。没有 Key 也能登录、管理文件、看样例，聊天区会提示去配置。
+
+### 方式一：Docker Compose 一键启动
+
+```bash
+cp .env.example .env          # Windows PowerShell: Copy-Item .env.example .env
+# 编辑 .env，在 DEEPSEEK_API_KEY= 后面填入自己的 Key
+docker compose up --build
+```
+
+首次构建会拉取 `node:22-alpine` 和 `python:3.12-slim` 并安装依赖，之后启动很快。浏览器打开 <http://localhost:8767>，注册账号（密码至少 7 位）即可开始。
+
+- 数据保存在命名卷里（默认名 `<目录名>_app-data`），`docker compose down` 不删数据，`docker compose down -v` 清空重来。
+- 端口被占用时用 `APP_PORT=9000 docker compose up --build`，然后访问 <http://localhost:9000>。
+- Compose 直接从同目录的 `.env` 读取变量注入容器，镜像里不包含 `.env`，Key 不会被打进镜像。
+
+### 方式二：本机运行（Python + Node）
+
+以下命令都在仓库根目录执行。
+
+**Windows PowerShell**
 
 ```powershell
 py -3.12 -m venv .venv
@@ -14,19 +62,11 @@ py -3.12 -m venv .venv
 npm --prefix frontend ci
 npm --prefix frontend run build
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-```
-
-已有虚拟环境时可跳过创建步骤。Windows 的 Python 安装若没有 `py` 命令，可以用已安装的 `python -m venv .venv`。也可用 `uv pip install --python .venv/Scripts/python.exe -r requirements.txt` 安装 Python 依赖。
-
-打开项目根目录的 `.env`，在 `DEEPSEEK_API_KEY=` 的等号后填入自己在 DeepSeek 平台创建的 Key。`DEEPSEEK_MODEL` 和 `DEEPSEEK_BASE_URL` 已有默认值。保留 `deepseek-flash` 和 `https://api.deepseek.com` 即可。模型请求通过 HTTP 流式接口发送。[DeepSeek 首次调用与 Key 入口](https://api-docs.deepseek.com/zh-cn/) · [工具调用协议](https://api-docs.deepseek.com/guides/tool_calls/)
-
-```powershell
+# 编辑 .env，填入 DEEPSEEK_API_KEY
 .\.venv\Scripts\python.exe -m uvicorn backend.app.api:app --host 127.0.0.1 --port 8767 --timeout-graceful-shutdown 3
 ```
 
-在浏览器打开 [本机工作区](http://127.0.0.1:8767)，点击“创建账号”注册并登录。密码至少 7 位。修改 `.env` 后重启服务。Key 留空时可以登录和管理文件，聊天区会提示如何配置。在启用 API 后，聊天文本和限长的工具结果会发给 DeepSeek，FASTA 文件由本机脚本读取。
-
-### macOS 或 Linux
+**macOS / Linux**
 
 ```bash
 python3.12 -m venv .venv
@@ -34,93 +74,104 @@ python3.12 -m venv .venv
 npm --prefix frontend ci
 npm --prefix frontend run build
 test -f .env || cp .env.example .env
+# 编辑 .env，填入 DEEPSEEK_API_KEY
+.venv/bin/python -m uvicorn backend.app.api:app --host 127.0.0.1 --port 8767 --timeout-graceful-shutdown 3
 ```
 
-按同样方式填写 `.env`，再运行 `.venv/bin/python -m uvicorn backend.app.api:app --host 127.0.0.1 --port 8767 --timeout-graceful-shutdown 3`。开发界面时可另开终端执行 `npm --prefix frontend run dev`，在 `http://127.0.0.1:5173` 打开 Vite 页面，API 仍走 8767。
+浏览器打开 <http://127.0.0.1:8767>。前端改样式时可另开终端跑 `npm --prefix frontend run dev`，Vite 在 `http://127.0.0.1:5173`，`/api` 代理到 8767。
 
-## 账号和工作区
+### 配置模型
 
-- **首页**保留历史会话、流式聊天、工具记录和当前会话任务。
-- **文件管理**支持上传、下载和将文件带入聊天分析。每个账号有自己的上传文件，同一账号可跨会话复用。三个内置题面样例供各账号使用。
-- **任务管理**按账号展示全部任务。可按状态筛选，按文件名或完整 ID 搜索。详情显示执行时间、退出码、标准输出和错误日志。长日志可以逐段阅读，任务结束后可下载完整文件。
-- **工具管理**提供 MCP 服务、工具列表和 Skills。新账号在「MCP 服务」中点击「添加本机 MCP」，完成工具发现后即可发起分析。升级前已存在的账号继续使用科研工具。
+`.env` 由 `.env.example` 复制而来：
 
-账号密码以带随机盐的 scrypt 哈希保存，浏览器使用会过期的 HttpOnly 会话 Cookie。SQLite 根据会话所属账号筛选文件、对话、任务和日志，实时事件也按账号推送。[OWASP 密码存储](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) · [OWASP 会话管理](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)
-
-### MCP 服务和 Skills
-
-- **本机科研任务服务。** FastAPI 使用当前 Python 解释器运行 `python -m backend.app.research_mcp`，由官方 MCP SDK 管理 stdio 子进程。前端点击添加时调用 `tools/list`，为当前账号保存启用状态。三个科研工具是任务流程的必需工具。
-- **外部 MCP。** 在 `.env` 的 `MCP_HTTP_ENDPOINTS` 中用逗号分隔可供各账号选择的可信 Streamable HTTP 地址，重启后端后在工具管理连接。默认地址是公开的 AWS Knowledge。成功接入后显示发现的工具，按账号启用 Server 和具体工具。刷新保留单工具开关，已从上游移除的工具标为不可用。[AWS Knowledge 接入文档](https://awslabs.github.io/mcp/servers/aws-knowledge-mcp-server#configuration)
-- **文字型 Skill。** 在 Skills 页添加名称、触发短语和说明。可填入「科研结果报告」示例。启用后，请求中出现触发短语时加载这份说明，用来组织结果。工具权限仍由后端控制。
-
-导航图标使用 Lucide，任务详情参考了科研作业管理中同时呈现状态、退出码和原始日志的设计。[Lucide 图标](https://lucide.dev/icons) · [Seqera 运行详情](https://docs.seqera.io/platform-cloud/getting-started/quickstart-demo/view-run-information)
-
-如果从旧的单用户版本升级，已有记录保留在原数据库中。确认整套旧记录归属同一个账号后，可在先注册该账号并备份 `var/` 的前提下，用本机命令将记录关联到它。旧文件重名时自动加数字后缀，任务记录保留提交时使用的文件名。
-
-```powershell
-.\.venv\Scripts\python.exe -m backend.app.assign_legacy -- 你的用户名
+```dotenv
+DEEPSEEK_API_KEY=            # 必填，只放在本机 .env 或环境变量里
+DEEPSEEK_MODEL=deepseek-flash
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_INPUT_TOKEN_BUDGET=24000
 ```
 
-### 跨会话分析偏好
+环境变量的优先级高于 `.env`。`.env` 已被 `.gitignore` 排除，仓库里只有空的 `.env.example`。调用走 DeepSeek 的 Chat Completions 流式接口，模型思考模式关闭，工具循环由本应用实现。Base URL 换成兼容 OpenAI 协议的服务时需要确认它支持 `tools` 与流式 `tool_calls`。
 
-结果展示顺序和 GC 百分比小数位数按账号保存在 SQLite 中。可以在聊天里说「以后统计 GC 时保留一位小数」或「记住，以后按序列 ID 升序展示结果」，后端会保存对应设置。同一账号开启新会话时，助手会在相关分析或结果查询中加载需要的偏好。比如 ORF 结果只会加载排序偏好。「这次保留两位小数」只影响当前轮次和当轮提交的任务。
+### 常见问题
 
-在会话侧栏底部的「分析偏好」可查看和修改已保存的设置。将某项改回「使用默认规则」即可清除对应偏好。
-
-序列统计在原始输出保留 G/C 碱基数 `gc_count` 和确定碱基数 `known_bases`。后端先读取当前请求指定的 0–2 位小数，再回退到账号偏好和默认的两位，使用这两个计数一次舍入。聊天工具卡会显示换算结果和计数。仅保存了两位小数的早期日志使用当时的数值。
+| 现象 | 原因与处理 |
+| --- | --- |
+| 页面 400 `Invalid host header` | 应用只接受 `localhost` / `127.0.0.1`，局域网 IP 访问会被拒绝；这是有意的本机限制 |
+| 聊天提示未配置 Key | `.env` 没填或改完没重启后端；Docker 方式修改 `.env` 后执行 `docker compose up -d --build` |
+| 自定义 Python 脚本任务报 `DOCKER_NOT_FOUND` | 自定义脚本在一次性容器里执行，需要本机 Docker（Windows 用 Linux 容器）。Docker Compose 方式下容器内没有 Docker，只支持两个内置分析 |
+| 端口 8767 被占用 | 本机方式改 `--port`；Compose 方式用 `APP_PORT` |
+| `npm run build` 报 Node 版本错误 | 升级到 Node 22.12+ 或 20.19+ |
 
 ## 演示路径
 
-1. 在新会话发送“帮我统计一下 sample1 里序列的 GC 含量”。提交后右侧出现任务。完成时自动出现状态、日志调用和解释。展开 `read_log` 可以核对 `seq1` 的 **45 nt、48.89%** 和 `seq2` 的 **47 nt、61.70%**。
-2. 在原会话继续说“再对 sample3 做一次”。助手沿用序列统计，并主动读新任务的错误日志。「待补充文件」高亮第 1 行缺少的 `>` 和第 2 行第 7–9、16–18 列的非法字符。核对原始数据后，可上传修正版并确认继续。
-3. 发送“找出 sample2 中每条序列最长的 ORF”。`gene_A` 的结果为 **6–83，共 78 nt**，`gene_B` 为 **7–21，共 15 nt**。任务运行时可切换会话，完成后原会话收到提示。
-4. 使用“上传 FASTA”添加自己的 `.fa`、`.fasta` 或 `.fna`，再发送一条分析请求。每个文件最大 5 MiB。上传成功显示登记名，分析阶段校验内容。刷新页面后可重新打开上次的会话并展开工具记录。
+按下面的顺序操作，能在 3–5 分钟内覆盖主要功能（也是录屏使用的顺序）：
 
-一份 3–5 分钟的录屏脚本和面谈要点在交付计划中。[三天排期与交付计划](docs/04-三天排期与交付计划.md)
+1. **统计 sample1 的 GC 含量。** 新建会话发送“帮我统计一下 sample1 里序列的 GC 含量”。助手调用 `submit_job`（`seq_stats` / `sample1.fasta`）拿到任务 ID，随后自动查状态、读日志并解释：`seq1` 为 45 nt、GC 48.89%，`seq2` 为 47 nt、GC 61.70%。
+2. **对 sample3 再来一次。** 在原会话说“再对 sample3 做一次”。助手沿用序列统计类型，新任务失败后主动读取错误日志，指出第 1 条序列缺少以 `>` 开头的标题行、第 2 行第 7–9 列（`XXX`）和第 16–18 列（`123`）含非法字符，并给出修正建议；界面同时显示「待补充文件」卡片，可上传修正版或预览格式修复后继续。
+3. **找 sample2 的 ORF。** 发送“找出 sample2 中每条序列最长的 ORF”。`gene_A` 为 6–83（78 nt），`gene_B` 为 7–21（15 nt）。
+4. **上传自己的文件再分析。** 点「上传 FASTA」添加 `.fa`/`.fasta`/`.fna` 文件，然后直接说“用 seq_stats 分析我上传的文件”。
+5. **刷新页面、切换会话。** 历史会话、工具卡片和任务日志都还在。
 
-## 架构和实现
+## 架构
 
 ```mermaid
 flowchart LR
-    UI["React 聊天与任务记录"] -->|HTTP| API["FastAPI"]
+    UI["React 单页<br/>聊天 / 任务 / 文件 / 扩展"] -->|HTTP + SSE| API["FastAPI 单进程"]
     API --> Agent["手写 ReAct 循环"]
-    Agent <-->|流式工具请求和观察| Model["DeepSeek Flash"]
-    Agent --> MCPClient["MCP Client"]
-    MCPClient <-->|stdio| MCPServer["本机科研 MCP 子进程"]
-    MCPClient <-->|Streamable HTTP| RemoteMCP["已启用的外部 MCP"]
-    MCPServer -->|本机 IPC| Tools["submit_job / job_status / read_log"]
-    Tools --> Jobs["本地任务管理器"]
-    Jobs -->|固定命令和参数| Python["两个 Python 分析子进程"]
-    Python --> Logs["stdout / stderr"]
-    Jobs -->|按任务 ID 安排续答| Agent
+    Agent <-->|流式 tool_calls| Model["DeepSeek Chat Completions"]
+    Agent <-->|MCP tools/list·tools/call| Client["MCP Client"]
+    Client <-->|stdio| Server["本机科研 MCP Server"]
+    Server --> Tools["submit_job / job_status / read_log"]
+    Tools --> Jobs["任务管理器<br/>2 并发子进程"]
+    Jobs --> Py["seq_stats.py / find_orf.py<br/>独立进程，4s 模拟耗时"]
+    Jobs --> Docker["自定义脚本<br/>一次性容器"]
+    Jobs -->|终态事件| Agent
+    Jobs --> Logs["stdout / stderr"]
     Agent --> DB[("SQLite")]
     Jobs --> DB
-    Agent -->|SSE 增量和工具记录| UI
-    Jobs -->|SSE 状态| UI
+    Logs --> DB
+    API --> DB
 ```
 
-- `backend/app/model.py` 解析 DeepSeek 流式正文、按索引拼齐工具参数。`backend/app/agent.py` 通过 MCP Client 获取工具结果，并回填对应的 `tool_call_id`。每阶段最多调用模型 6 轮。DeepSeek 的模型思考模式使用关闭配置，调用工具和消费结果的 ReAct 循环由应用实现。
-- `backend/app/research_mcp.py` 定义并注册 `submit_job`、`job_status`、`read_log`。`backend/app/mcp_tools.py` 的 Client 通过 `tools/list` 获取定义，并通过 `tools/call` 调用工具。Server 子进程使用标准输入和输出通信，内部转发使用本机命名管道或 Unix 域套接字。FastAPI 继续管理账号权限、SQLite、任务队列和通知。前端和 API 使用原来的 `8767`，本机 MCP 子进程无需监听 TCP 端口。[MCP stdio 规范](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio) · [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk)
-- `backend/app/external_mcp.py` 负责外部 Server 连接和工具发现。后端按账号与两个启用开关筛选候选工具，执行前再次校验启用状态和工具自己的 JSON Schema。同名工具用各自的 Server 和工具标识定位。
-- `backend/app/jobs.py` 本地最多同时执行两个任务。每个脚本内部延时 4 秒，提交立即返回，单任务上限默认 60 秒。任务的退出码和输出由后端记录。任务结束时，助手查询同一个 ID，再读日志生成解释。
-- `backend/app/store.py` 管理 SQLite 中的账号与会话凭证、对话、工具记录、文件登记和任务。相同客户端消息的重发使用同一消息 ID，重复工具提交复用同一任务。重启时继续处理已排队的任务和计划重试，执行中的任务记为中断，待解释的终态可从原日志恢复。
-- `scripts/` 放两个可单独运行的脚本。统计以 A、C、G、T 为 GC 分母，IUPAC 歧义碱基计入总长度。ORF 取正链三个阅读框中最长的完整 `ATG` 到同框终止区间，坐标从 1 开始、含两端，等长取较早起点。`sample3` 的两处错误由同一个共享解析器收集。
-- `frontend/` 通过一个 SSE 连接接收消息增量、工具轨迹和任务通知。断线后从 SQLite 快照恢复。`var/` 保存 SQLite、上传文件和两路原始日志，工具预览每路最多约 8 KiB。任务记录可下载完整日志。模型调用失败时，系统仍能读取本机日志，并提供“重新解释”。
+一段话说清：浏览器只和 FastAPI 通信，消息增量、工具轨迹和任务状态都走同一条 SSE 连接。FastAPI 进程里跑着手写的 ReAct 循环，它通过 MCP Client 以 stdio 连接本机的科研 MCP Server，Server 里是题目要求的三个工具。`submit_job` 把任务交给任务管理器，由后者启动 Python 子进程（自定义脚本则放进一次性 Docker 容器），两路日志写入 `var/`；任务结束或失败时，任务管理器按任务 ID 唤醒原会话的助手，助手再读状态和日志生成解释。账号、会话、消息、工具记录、文件和任务都存在 SQLite 里。
 
-已实现的加分项包括 MCP 封装、主动完成通知、上传 FASTA 和关键用例测试。外部 MCP 的发现、分开启停以及按需加载 Skill 的方式参考了 Data Agent 的扩展管理实现。Docker Compose 留作后续选项。对照项目、计算基准和验收条件见评审文档。[技术方案](docs/02-技术调研与开发方案.md) · [样例基准与验收用例](docs/03-样例基准与验收用例.md)
+| 模块 | 职责 |
+| --- | --- |
+| `frontend/` | React + TypeScript 单页；会话列表、流式聊天、工具卡片、任务/文件/扩展管理 |
+| `backend/app/api.py` | HTTP 接口、账号鉴权、SSE、静态资源 |
+| `backend/app/agent.py` | ReAct 循环、上下文预算、失败解释、主动续答 |
+| `backend/app/model.py` | DeepSeek 流式协议解析（正文增量、按索引拼装工具参数） |
+| `backend/app/mcp_tools.py` + `research_mcp.py` | MCP Client / Server 与工具定义 |
+| `backend/app/jobs.py`、`docker_runner.py` | 任务队列、子进程与容器执行、日志截断与分页 |
+| `backend/app/store.py` | SQLite 表结构与账号隔离查询 |
+| `backend/app/context.py`、`preferences.py`、`extensions.py` | 上下文压缩、展示偏好、MCP/Skills 扩展 |
+| `scripts/` | 两个可单独运行的分析脚本与共用的 FASTA 校验器 |
+| `data/` | 题面提供的三个样例 |
 
-## 失败任务与重跑
+## 关键实现
 
-- 聊天和任务管理使用后端计算的排队等待时长与执行时长。脚本在后台执行时可以继续聊天，任务结束后助手会主动在原会话报告结果。
-- 打开任务管理里的失败任务可查看分类、失败阶段和原始日志。选择「重新运行」会创建关联的新任务，同一失败记录的重复提交会返回同一个后续任务。通过「尝试记录」可以切换查看各次运行。
-- 进程启动明确因资源暂不可用时，后端默认最多自动重试两次，分别延迟 3 秒和 6 秒。超时、持续资源不足和配置错误会保留失败信息，处理原因后可以手动重跑。
-- 文件缺失或输入校验失败时，在原会话的「待补充文件」卡片选择或上传文件，再确认继续。格式错误显示日志定位到的行列和本机原文片段。只有补齐首条标题后能通过完整校验的文件才提供格式修复预览。确认后系统保存副本并关联新任务，原文件和失败日志保留。
+- **工具就是 MCP 工具。** `research_mcp.py` 注册 `submit_job`、`job_status`、`read_log`，客户端通过 `tools/list` 取定义、`tools/call` 调用，服务端用标准输入输出通信，不额外监听端口。
+- **任务真的在后台跑。** `submit_job` 立即返回任务 ID；任务管理器最多同时执行两个任务，单任务默认 60 秒上限。`read_log` 的预览每路最多约 8 KiB，超出部分标记截断；完整日志可以分页读取或下载。
+- **失败不是一句话。** 分析脚本用共享的 FASTA 校验器收集全部问题（行号、列区间、非法字符），以 JSON 写到 stderr 后退出码 2。任务管理器据此分类为输入错误、依赖缺失、内存不足、超时等，助手读日志后翻译成自然语言并给建议。`sample3` 的两类问题会被同时报出。
+- **会话恢复。** 重启后继续处理已排队的任务和计划中的重试；执行中的任务标记为中断；已失败但还没解释的任务可以从原日志继续解释。
+- **上下文预算。** 每次请求按完整轮次装入近期对话，预算默认 24,000 token（`DEEPSEEK_INPUT_TOKEN_BUDGET`）。窗口收紧时优先缩短旧日志预览，工具调用与结果按 ID 成对保留；旧轮次滑出窗口后写入滚动摘要。
+- **两个分析口径。** GC 以 A/C/G/T 为分母，IUPAC 歧义碱基计入长度但不计入 GC，Rust 与 Python 都用同一舍入方式；ORF 只看正链三个阅读框中最长的完整 `ATG` 到同框终止密码子区间，坐标从 1 开始、含两端，等长时取较早起点。
 
-## 长会话上下文
+## 目录结构
 
-每次请求 DeepSeek 前，`context.py` 按完整轮次装入近期对话。预算包括系统指令、当前问题、工具定义和本轮工具结果。预算紧张时减少较早轮次并缩短日志预览，工具调用与结果仍按 ID 配对。可在 `.env` 配置 `DEEPSEEK_INPUT_TOKEN_BUDGET`，默认 24,000。程序以序列化后的 UTF-8 大小加协议余量作保守估算，实际用量以 DeepSeek API 返回为准。[DeepSeek Token 用量说明](https://api-docs.deepseek.com/quick_start/token_usage/)
-
-当至少 4 个尚未概括的旧轮次滑出窗口时，助手分批更新 SQLite 中的滚动摘要。摘要保存覆盖到的消息 ID，重启后继续使用。摘要生成失败时，本轮仍可用当前上下文回答。用户在同一会话按任务 ID 或文件名追问时，后端从 SQLite 取回任务记录，再由 Agent 调用状态或日志工具。完整聊天记录、工具轨迹和任务日志可在工作区回看。
+```text
+backend/app/         后端模块
+frontend/            React 前端（构建产物 dist/ 由后端托管）
+scripts/             两个分析脚本
+data/                sample1–3.fasta
+tests/               66 个用例
+docs/                需求分析、技术方案、验收基准、排期与录屏脚本
+Dockerfile           多阶段构建（Node 构建前端 → Python 运行后端）
+docker-compose.yml   一键启动
+requirements.txt     Python 依赖（全部固定版本）
+.env.example         模型配置模板（不含真实 Key）
+```
 
 ## 测试
 
@@ -129,14 +180,42 @@ flowchart LR
 npm --prefix frontend run build
 ```
 
-测试使用可控的模型流式响应，实际运行本机分析子进程和 SQLite。覆盖样例结果、异步运行、会话恢复、跨账号访问、完整日志读取、逐次调用预算、摘要续写以及旧任务回查。真实模型联调使用上面的演示路径，需要自己的 Key。
+不访问真实模型、不需要 Docker：模型侧用可控的流式响应替身，其余按真实路径执行（SQLite、子进程、MCP、SSE）。覆盖内容包括：
 
-## 打包
+- 三个样例的基准值与 `sample3` 的两项诊断（行号、列区间、非法字符）；
+- GC 舍入、历史日志兼容、ORF 边界与并列规则、BOM/多行/歧义碱基输入；
+- 异步任务全流程、日志截断与分页、超时与自动重试、失败分类；
+- 账号隔离（文件、任务、工具开关、事件推送）、会话恢复、总结续写、上下文预算；
+- MCP 工具发现与调用、外部 MCP（HTTP/SSE/stdio）、Skills 导入与启用；
+- 模型流式解析的异常分支、配置解析、Docker 容器隔离参数。
 
-本地 Git 提交记录保留开发过程。准备评审材料时使用一个独立的 Git 仓库链接，或用 Git bundle 保存全部提交历史。
+在 Windows 11 + Python 3.12.14 上最后一次全量运行：66 个用例全部通过，耗时约 4 分钟。
 
-```powershell
-git bundle create research-task-assistant.bundle --all
-```
+## 取舍与未完成
 
-接收方可用 `git clone research-task-assistant.bundle research-task-assistant` 恢复源码和历史。`.env`、`var/` 和 Office 源题均由 `.gitignore` 排除。提交给研究院时，附上使用真实模型录制的 3–5 分钟演示，包含 `sample3` 的失败诊断。
+**做了的取舍**
+
+- **单进程 + SQLite，而不是 Redis/Celery。** 题目限定本机、评审者要能复现，少一个中间件就少一处启动失败；任务并发上限 2 由进程内队列控制，重启后从 SQLite 恢复。
+- **自建账号体系，只服务本机。** 密码用带随机盐的 scrypt 存储，会话是 HttpOnly Cookie；Host 头只允许 `localhost`/`127.0.0.1`，不做 HTTPS、不做远程多租户。对“在自己电脑上运行”的题面，这比接 OAuth 更直接。
+- **只接 DeepSeek 一家。** 流式正文和 `tool_calls` 的拼接按 DeepSeek 协议实现，换供应商要改 `model.py`；换来的是能自己控制每个增量、工具参数和错误分支。
+- **自定义脚本必须走 Docker。** 上传的 `.py` 只挂在只读目录、无网络、非 root、限制 CPU/内存/进程数。代价是没装 Docker 的机器上只能跑两个内置分析——这是有意的安全边界，不是遗漏。
+- **失败诊断在脚本侧做。** 分析脚本自己收集全部格式问题并以结构化 JSON 报错，而不是让模型从原始 traceback 猜原因；助手只负责翻译和给建议。
+- **日志会截断。** 送给模型的日志每路最多约 8 KiB，界面预览同样限长，完整内容走分页/下载，避免长日志把上下文预算吃光。
+
+**没来得及做 / 已知限制**
+
+- 没做密码找回、账号删除、审计日志——本机单人使用，账号只解决“多个人用同一台机器时数据别串”。
+- 没做多模型路由、失败自动降级；模型不可用时只能人工重试解释。
+- 外部 MCP 只支持公开地址和部署者在 `.env` 登记的本机命令，没有 OAuth 授权流程；远程服务端需要自己保证鉴权。
+- 只在 Windows 11 上完整验证过；macOS/Linux 的路径和子进程逻辑按标准库写，但没有实机跑过。
+- Docker Compose 模式里跑不了自定义 Python 脚本（容器内没有 Docker CLI/守护进程）。
+- **Docker 验证说明（如实交代）**：开发这台的机器没有安装 Docker Desktop，因此没有在本机执行过完整镜像构建。已做的验证：用 Docker Compose v5.8 对 `docker-compose.yml` 执行 `config`（变量替换、卷、健康检查均通过），并在本机按镜像内相同步骤跑通 `npm ci` 锁文件校验、`npm run build`、`pip install -r requirements.txt`、`uvicorn` 启动与页面/接口访问。首次在你机器上执行 `docker compose up --build` 需要能拉取上述两个基础镜像。
+
+## 文档与演示
+
+- [需求分析与业务流程](docs/01-需求分析与业务流程.md)
+- [技术调研与开发方案](docs/02-技术调研与开发方案.md)
+- [样例基准与验收用例](docs/03-样例基准与验收用例.md)
+- [排期、风险与录屏脚本](docs/04-三天排期与交付计划.md)
+
+演示录屏（3–5 分钟，含 `sample3` 的失败处理）在 [`recordings/demo.mp4`](recordings/demo.mp4)；对应的分镜和讲解词见[录屏脚本](docs/demo-script.md)。
